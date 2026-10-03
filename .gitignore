@@ -14,4 +14,4 @@ nul
 juicer.kn.amalgamated
 juicer.exe
 jc.exe
-kain/juicer.kn
+*.gguf

@@ -23,12 +23,12 @@ pub fn run_prove_battery() -> Int with Unsafe:
     // [1/7] Binary LE Decoders & +32 Slack Rule
     print("[1/7] Binary LE Decoders & +32 Slack Arena ... ")
     let buf: ptr<Byte> = alloc_zeroed(64 + 32, "Byte")
-    write_u32_le(buf, 0, 1179797319) // GGUF magic
+    write_u32_le(buf, 0, GGUF_MAGIC) // GGUF magic
     write_u64_le(buf, 4, 12345678901234)
     let m: Int = read_u32_le(buf, 0)
     let v64: Int = read_u64_le(buf, 4)
     decay buf
-    if m == 1179797319 and v64 == 12345678901234:
+    if m == GGUF_MAGIC and v64 == 12345678901234:
         println("PASS")
     else:
         println("FAIL (m=" + str(m) + ", v64=" + str(v64) + ")")

@@ -103,7 +103,7 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
 
     let magic: Int = read_u32_le(hdr_buf, 0)
     // 0x46554747 is 'GGUF' in LE
-    if magic != 1179797319:
+    if magic != GGUF_MAGIC:
         println("gguf_parser: invalid GGUF magic (expected GGUF)")
         decay hdr_buf
         decay nslot

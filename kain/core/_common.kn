@@ -48,6 +48,8 @@ pub const EXIT_OK: Int = 0
 pub const EXIT_HELP: Int = 1
 pub const EXIT_ERROR: Int = 2
 
+pub const GGUF_MAGIC: Int = 1179993927 // 'GGUF' in LE: 0x46554747
+
 pub const PI: Float = 3.141592653589793
 pub const TWO_PI: Float = 6.283185307179586
 
