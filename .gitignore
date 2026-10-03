@@ -1,0 +1,17 @@
+/.cache/
+.cache/
+/models/
+/models
+models/
+/.kain/
+*.exe
+*.obj
+*.ll
+*.pdb
+*.ilk
+*.tmp
+nul
+juicer.kn.amalgamated
+juicer.exe
+jc.exe
+kain/juicer.kn
