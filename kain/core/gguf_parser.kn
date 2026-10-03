@@ -1,0 +1,356 @@
+// ============================================================================
+// gguf_parser.kn — High-speed GGUF v2/v3 header & tensor directory reader
+//
+// Reads GGUF metadata and tensor descriptors via direct kernel32 DMA file I/O.
+// Extracts model architecture, layer block topology, and tensor byte offsets.
+// ============================================================================
+
+use std::runtime
+use std::text
+use std::bytes
+
+pub struct GgufTensor:
+    name: String
+    n_dims: Int
+    dim0: Int
+    dim1: Int
+    dim2: Int
+    dim3: Int
+    type_id: Int
+    offset: Int
+    size_bytes: Int
+    block_idx: Int
+
+pub struct GgufBlock:
+    block_idx: Int
+    tensor_count: Int
+    total_bytes: Int
+
+pub struct GgufModel:
+    path: String
+    file_size: Int
+    version: Int
+    tensor_count: Int
+    kv_count: Int
+    arch: String
+    block_count: Int
+    alignment: Int
+    tensor_data_offset: Int
+    tensors: Array<GgufTensor>
+    blocks: Array<GgufBlock>
+
+pub fn parse_block_index_from_name(name: String) -> Int:
+    // Pattern 1: "blocks.<id>." (Wan 2.1, LLaMA, Qwen, etc.)
+    if str_starts_with(name, "blocks.") == 1:
+        let dot2: Int = find_from(name, ".", 7)
+        if dot2 > 7:
+            let num_str: String = text_substring_string(name, 7, dot2 - 7)
+            return parse_int_text(num_str)
+    // Pattern 2: "double_blocks.<id>." (Flux double blocks)
+    if str_starts_with(name, "double_blocks.") == 1:
+        let dot2: Int = find_from(name, ".", 14)
+        if dot2 > 14:
+            let num_str: String = text_substring_string(name, 14, dot2 - 14)
+            return parse_int_text(num_str)
+    // Pattern 3: "single_blocks.<id>." (Flux single blocks)
+    if str_starts_with(name, "single_blocks.") == 1:
+        let dot2: Int = find_from(name, ".", 14)
+        if dot2 > 14:
+            let num_str: String = text_substring_string(name, 14, dot2 - 14)
+            return parse_int_text(num_str) + 1000 // offset single blocks
+    // Pattern 4: "blk.<id>."
+    if str_starts_with(name, "blk.") == 1:
+        let dot2: Int = find_from(name, ".", 4)
+        if dot2 > 4:
+            let num_str: String = text_substring_string(name, 4, dot2 - 4)
+            return parse_int_text(num_str)
+    return -1
+
+pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
+    let empty_tensors: Array<GgufTensor> = []
+    let empty_blocks: Array<GgufBlock> = []
+    let empty_model = GgufModel {
+        path: path,
+        file_size: 0,
+        version: 0,
+        tensor_count: 0,
+        kv_count: 0,
+        arch: "unknown",
+        block_count: 0,
+        alignment: 32,
+        tensor_data_offset: 0,
+        tensors: empty_tensors,
+        blocks: empty_blocks,
+    }
+
+    let h: ptr<Void> = k_open_read(path)
+    if k_handle_bad(h) == 1:
+        println("gguf_parser: failed to open " + path)
+        return empty_model
+
+    let fsz: Int = k_size(h)
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+
+    // Read header (first 32 bytes)
+    let hdr_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let r_hdr: Int = k_read_at(h, nslot, 0, hdr_buf, 32)
+    if r_hdr < 24:
+        println("gguf_parser: file too small for header")
+        decay hdr_buf
+        decay nslot
+        let _c: Int = k_CloseHandle(h)
+        return empty_model
+
+    let magic: Int = read_u32_le(hdr_buf, 0)
+    // 0x46554747 is 'GGUF' in LE
+    if magic != 1179797319:
+        println("gguf_parser: invalid GGUF magic (expected GGUF)")
+        decay hdr_buf
+        decay nslot
+        let _c: Int = k_CloseHandle(h)
+        return empty_model
+
+    let ver: Int = read_u32_le(hdr_buf, 4)
+    let t_count: Int = read_u64_le(hdr_buf, 8)
+    let kv_count: Int = read_u64_le(hdr_buf, 16)
+    decay hdr_buf
+
+    var arch_name: String = "unknown"
+    var detected_alignment: Int = 32
+
+    // Stream KV entries with a dynamic buffer
+    var cur_off: Int = 24
+    let buf_sz: Int = 65536
+    let io_buf: ptr<Byte> = alloc_zeroed(buf_sz + 32, "Byte")
+    var buf_file_off: Int = cur_off
+    let _r_init: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+
+    var kv_i: Int = 0
+    while kv_i < kv_count:
+        // Ensure we have at least 16 bytes for key length
+        if (cur_off - buf_file_off) + 16 > buf_sz:
+            buf_file_off = cur_off
+            let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+
+        let klen: Int = read_u64_le(io_buf, cur_off - buf_file_off)
+        cur_off = cur_off + 8
+
+        // Read key string
+        var key_arr: Array<Int> = []
+        var ki: Int = 0
+        while ki < klen:
+            if (cur_off - buf_file_off) >= buf_sz:
+                buf_file_off = cur_off
+                let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+            push(key_arr, bref(io_buf, cur_off - buf_file_off))
+            cur_off = cur_off + 1
+            ki = ki + 1
+        let key_str: String = text_from_byte_array(key_arr)
+
+        // Read val_type
+        if (cur_off - buf_file_off) + 4 > buf_sz:
+            buf_file_off = cur_off
+            let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+        let val_type: Int = read_u32_le(io_buf, cur_off - buf_file_off)
+        cur_off = cur_off + 4
+
+        // Parse or skip value based on type
+        if val_type == 0 or val_type == 1 or val_type == 7:
+            // uint8, int8, bool (1 byte)
+            cur_off = cur_off + 1
+        elif val_type == 2 or val_type == 3:
+            // uint16, int16 (2 bytes)
+            cur_off = cur_off + 2
+        elif val_type == 4 or val_type == 5 or val_type == 6:
+            // uint32, int32, float32 (4 bytes)
+            if (cur_off - buf_file_off) + 4 > buf_sz:
+                buf_file_off = cur_off
+                let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+            if key_str == "general.alignment":
+                detected_alignment = read_u32_le(io_buf, cur_off - buf_file_off)
+            cur_off = cur_off + 4
+        elif val_type == 8:
+            // string (uint64 len + string bytes)
+            if (cur_off - buf_file_off) + 8 > buf_sz:
+                buf_file_off = cur_off
+                let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+            let slen: Int = read_u64_le(io_buf, cur_off - buf_file_off)
+            cur_off = cur_off + 8
+            if key_str == "general.architecture":
+                var arch_arr: Array<Int> = []
+                var si: Int = 0
+                while si < slen:
+                    if (cur_off - buf_file_off) >= buf_sz:
+                        buf_file_off = cur_off
+                        let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+                    push(arch_arr, bref(io_buf, cur_off - buf_file_off))
+                    cur_off = cur_off + 1
+                    si = si + 1
+                arch_name = text_from_byte_array(arch_arr)
+            else:
+                cur_off = cur_off + slen
+        elif val_type == 10 or val_type == 11 or val_type == 12:
+            // uint64, int64, float64 (8 bytes)
+            cur_off = cur_off + 8
+        elif val_type == 9:
+            // array: item_type (uint32) + count (uint64)
+            if (cur_off - buf_file_off) + 12 > buf_sz:
+                buf_file_off = cur_off
+                let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+            let item_type: Int = read_u32_le(io_buf, cur_off - buf_file_off)
+            let arr_count: Int = read_u64_le(io_buf, cur_off - buf_file_off + 4)
+            cur_off = cur_off + 12
+            if item_type == 0 or item_type == 1 or item_type == 7:
+                cur_off = cur_off + arr_count
+            elif item_type == 2 or item_type == 3:
+                cur_off = cur_off + arr_count * 2
+            elif item_type == 4 or item_type == 5 or item_type == 6:
+                cur_off = cur_off + arr_count * 4
+            elif item_type == 10 or item_type == 11 or item_type == 12:
+                cur_off = cur_off + arr_count * 8
+            elif item_type == 8:
+                // Array of strings
+                var ai: Int = 0
+                while ai < arr_count:
+                    if (cur_off - buf_file_off) + 8 > buf_sz:
+                        buf_file_off = cur_off
+                        let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+                    let elem_len: Int = read_u64_le(io_buf, cur_off - buf_file_off)
+                    cur_off = cur_off + 8 + elem_len
+                    ai = ai + 1
+        kv_i = kv_i + 1
+
+    // Parse Tensor Descriptors
+    var tensor_list: Array<GgufTensor> = []
+    var max_block_id: Int = -1
+
+    var ti: Int = 0
+    while ti < t_count:
+        if (cur_off - buf_file_off) + 16 > buf_sz:
+            buf_file_off = cur_off
+            let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+
+        let nlen: Int = read_u64_le(io_buf, cur_off - buf_file_off)
+        cur_off = cur_off + 8
+
+        var tname_arr: Array<Int> = []
+        var tni: Int = 0
+        while tni < nlen:
+            if (cur_off - buf_file_off) >= buf_sz:
+                buf_file_off = cur_off
+                let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+            push(tname_arr, bref(io_buf, cur_off - buf_file_off))
+            cur_off = cur_off + 1
+            tni = tni + 1
+        let tensor_name: String = text_from_byte_array(tname_arr)
+
+        if (cur_off - buf_file_off) + 4 > buf_sz:
+            buf_file_off = cur_off
+            let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+        let ndims: Int = read_u32_le(io_buf, cur_off - buf_file_off)
+        cur_off = cur_off + 4
+
+        var d0: Int = 1
+        var d1: Int = 1
+        var d2: Int = 1
+        var d3: Int = 1
+        var di: Int = 0
+        while di < ndims:
+            if (cur_off - buf_file_off) + 8 > buf_sz:
+                buf_file_off = cur_off
+                let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+            let dval: Int = read_u64_le(io_buf, cur_off - buf_file_off)
+            if di == 0:
+                d0 = dval
+            elif di == 1:
+                d1 = dval
+            elif di == 2:
+                d2 = dval
+            elif di == 3:
+                d3 = dval
+            cur_off = cur_off + 8
+            di = di + 1
+
+        if (cur_off - buf_file_off) + 12 > buf_sz:
+            buf_file_off = cur_off
+            let _r: Int = k_read_at(h, nslot, cur_off, io_buf, buf_sz)
+        let type_id: Int = read_u32_le(io_buf, cur_off - buf_file_off)
+        let t_offset: Int = read_u64_le(io_buf, cur_off - buf_file_off + 4)
+        cur_off = cur_off + 12
+
+        let b_idx: Int = parse_block_index_from_name(tensor_name)
+        if b_idx > max_block_id:
+            max_block_id = b_idx
+
+        let item = GgufTensor {
+            name: tensor_name,
+            n_dims: ndims,
+            dim0: d0,
+            dim1: d1,
+            dim2: d2,
+            dim3: d3,
+            type_id: type_id,
+            offset: t_offset,
+            size_bytes: 0,
+            block_idx: b_idx,
+        }
+        push(tensor_list, item)
+        ti = ti + 1
+
+    // Alignment padding to find data start
+    var data_offset: Int = cur_off
+    let rem: Int = data_offset % detected_alignment
+    if rem != 0:
+        data_offset = data_offset + (detected_alignment - rem)
+
+    // Compute tensor sizes from consecutive offsets
+    var si: Int = 0
+    while si < len(tensor_list):
+        var tsz: Int = 0
+        if si + 1 < len(tensor_list):
+            tsz = tensor_list[si + 1].offset - tensor_list[si].offset
+        else:
+            tsz = fsz - (data_offset + tensor_list[si].offset)
+        tensor_list[si].size_bytes = tsz
+        si = si + 1
+
+    decay io_buf
+    decay nslot
+    let _close_rc: Int = k_CloseHandle(h)
+
+    // Group tensors into block summary
+    var block_list: Array<GgufBlock> = []
+    let num_blocks: Int = max_block_id + 1
+    if num_blocks > 0:
+        var bi: Int = 0
+        while bi < num_blocks:
+            var b_t_count: Int = 0
+            var b_total_bytes: Int = 0
+            var tj: Int = 0
+            while tj < len(tensor_list):
+                if tensor_list[tj].block_idx == bi:
+                    b_t_count = b_t_count + 1
+                    b_total_bytes = b_total_bytes + tensor_list[tj].size_bytes
+                tj = tj + 1
+            if b_t_count > 0:
+                let blk = GgufBlock {
+                    block_idx: bi,
+                    tensor_count: b_t_count,
+                    total_bytes: b_total_bytes,
+                }
+                push(block_list, blk)
+            bi = bi + 1
+
+    return GgufModel {
+        path: path,
+        file_size: fsz,
+        version: ver,
+        tensor_count: t_count,
+        kv_count: kv_count,
+        arch: arch_name,
+        block_count: len(block_list),
+        alignment: detected_alignment,
+        tensor_data_offset: data_offset,
+        tensors: tensor_list,
+        blocks: block_list,
+    }

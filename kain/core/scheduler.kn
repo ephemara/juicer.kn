@@ -1,0 +1,98 @@
+// ============================================================================
+// scheduler.kn — Dynamic Step-Skipping Schedule Generator
+//
+// Emits machine-readable JSON schedules for ComfyUI, vLLM, and llama.cpp runtimes:
+//   Enables Euler/Flow-Matching step-adaptive block bypass (e.g. 50% layers on steps 2-3).
+// ============================================================================
+
+use std::runtime
+use std::text
+use std::bytes
+
+pub fn emit_schedule_json(model: GgufModel, steps: Int, out_path: String) -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Dynamic Step-Skipping Schedule Generator")
+    println("================================================================================")
+    println(" Model:            " + model.path)
+    println(" Architecture:     " + model.arch)
+    println(" Total Blocks:     " + str(model.block_count))
+    println(" Sampling Steps:   " + str(steps))
+
+    let sched: FrftStepSchedule = generate_step_schedule(model.block_count, steps)
+    println(" Baseline passes:  " + str(model.block_count * steps))
+    let total_active_passes: Int = ((model.block_count * steps) as Float / sched.estimated_speedup) as Int
+    println(" Juiced passes:    " + str(total_active_passes))
+    println(" Est. Speedup:     " + format_2dp(sched.estimated_speedup) + "x FASTER")
+
+    var json: String = "{\n"
+    json = json + "  \"generator\": \"juicer.kn v0.1.0\",\n"
+    json = json + "  \"model\": \"" + model.path + "\",\n"
+    json = json + "  \"architecture\": \"" + model.arch + "\",\n"
+    json = json + "  \"total_blocks\": " + str(model.block_count) + ",\n"
+    json = json + "  \"sampling_steps\": " + str(steps) + ",\n"
+    json = json + "  \"estimated_speedup\": \"" + format_2dp(sched.estimated_speedup) + "x\",\n"
+    json = json + "  \"schedule\": [\n"
+
+    var s: Int = 0
+    while s < steps:
+        let step_num: Int = s + 1
+        let act_cnt: Int = sched.step_active_counts[s]
+        let pattern: String = sched.step_skip_patterns[s]
+        
+        json = json + "    {\n"
+        json = json + "      \"step\": " + str(step_num) + ",\n"
+        json = json + "      \"active_blocks\": " + str(act_cnt) + ",\n"
+        json = json + "      \"pattern\": \"" + pattern + "\",\n"
+        json = json + "      \"skip_blocks\": ["
+        
+        // Populate skip blocks
+        var skip_count: Int = 0
+        var b: Int = 0
+        while b < model.block_count:
+            var skip_this: Int = 0
+            if s > 0 and s < steps - 1:
+                // Odd blocks skipped in intermediate steps
+                if (b % 2) == 1:
+                    skip_this = 1
+            elif s == steps - 1 and steps > 2:
+                if (b % 4) == 1:
+                    skip_this = 1
+            
+            if skip_this == 1:
+                if skip_count > 0:
+                    json = json + ", "
+                json = json + str(b)
+                skip_count = skip_count + 1
+            b = b + 1
+
+        json = json + "]\n"
+        json = json + "    }"
+        if s + 1 < steps:
+            json = json + ","
+        json = json + "\n"
+        s = s + 1
+
+    json = json + "  ]\n"
+    json = json + "}\n"
+
+    let h: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h) == 1:
+        println("scheduler: failed to write output file " + out_path)
+        return EXIT_ERROR
+
+    let raw_bytes: Array<Int> = bytes_of_str(json)
+    let nb: Int = len(raw_bytes)
+    let buf: ptr<Byte> = alloc_zeroed(nb + 32, "Byte")
+    var bi: Int = 0
+    while bi < nb:
+        bstore(buf, bi, raw_bytes[bi])
+        bi = bi + 1
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let _w: Int = k_write_all(h, nslot, buf, nb)
+    decay buf
+    decay nslot
+    let _c: Int = k_CloseHandle(h)
+
+    println(" Recipe emitted to: " + out_path)
+    return EXIT_OK

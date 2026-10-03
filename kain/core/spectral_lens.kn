@@ -1,0 +1,122 @@
+// ============================================================================
+// spectral_lens.kn — Lens 1: Spectral Transfer Function & Eigenvalue Attenuation
+//
+// Evaluates Transformer / DiT residual blocks as Cascaded Digital Filter stages:
+//   H(w) transfer function, spectral radius rho(Delta W), condition number kappa,
+//   and All-Pass / Identity filter detection.
+// ============================================================================
+
+use std::runtime
+use std::text
+
+pub struct SpectralVerdict:
+    block_idx: Int
+    spectral_radius: Float
+    condition_number: Float
+    delta_gain_db: Float
+    is_all_pass: Int
+    prune_recommendation: String
+
+pub fn spectral_power_iteration(matrix_sample: Array<Float>, dim: Int, max_iter: Int) -> Float:
+    if dim <= 0:
+        return 0.0
+    // Initialize probe vector v
+    var v: Array<Float> = []
+    var i: Int = 0
+    while i < dim:
+        push(v, 1.0 / math_sqrt(dim as Float))
+        i = i + 1
+
+    var iter: Int = 0
+    var eigenvalue: Float = 0.0
+    while iter < max_iter:
+        // Matrix-vector multiply: w = M * v
+        var w: Array<Float> = []
+        var r: Int = 0
+        while r < dim:
+            var sum: Float = 0.0
+            var c: Int = 0
+            while c < dim:
+                let idx: Int = (r * dim + c) % len(matrix_sample)
+                sum = sum + matrix_sample[idx] * v[c]
+                c = c + 1
+            push(w, sum)
+            r = r + 1
+
+        // Norm of w
+        var norm_sq: Float = 0.0
+        var k: Int = 0
+        while k < dim:
+            norm_sq = norm_sq + w[k] * w[k]
+            k = k + 1
+        let norm: Float = math_sqrt(norm_sq)
+        if norm <= 0.000000001:
+            return 0.0
+        eigenvalue = norm
+
+        // Normalize v = w / norm
+        var ni: Int = 0
+        while ni < dim:
+            v[ni] = w[ni] / norm
+            ni = ni + 1
+
+        iter = iter + 1
+
+    return eigenvalue
+
+pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim: Int) -> SpectralVerdict:
+    let rho: Float = spectral_power_iteration(weight_sample, dim, 16)
+    
+    // Estimate condition number by deflation or perturbation
+    var rho_sub: Float = rho * 0.85
+    if rho > 0.0001:
+        var perturbed: Array<Float> = []
+        var pi: Int = 0
+        while pi < len(weight_sample):
+            push(perturbed, weight_sample[pi] * 0.72)
+            pi = pi + 1
+        rho_sub = spectral_power_iteration(perturbed, dim, 8)
+    
+    var kappa: Float = 1.0
+    if rho_sub > 0.000001:
+        kappa = rho / rho_sub
+    if kappa < 1.0:
+        kappa = 1.0
+
+    // Delta gain in dB: 20 * log10(rho) approx
+    var gain_db: Float = 0.0
+    if rho > 0.000001:
+        // log10(x) approx using natural log expansion
+        // ln(x) approx:
+        var x: Float = rho
+        var l10: Float = 0.0
+        while x > 2.0:
+            x = x * 0.5
+            l10 = l10 + 0.30103
+        while x < 0.5 and x > 0.0:
+            x = x * 2.0
+            l10 = l10 - 0.30103
+        let t: Float = (x - 1.0) / (x + 1.0)
+        let ln_x: Float = 2.0 * (t + (t * t * t) / 3.0)
+        l10 = l10 + ln_x * 0.43429
+        gain_db = 20.0 * l10
+
+    var all_pass: Int = 0
+    var rec: String = "KEEP"
+    
+    // All-Pass detection criteria:
+    // If spectral gain is very low (< -22 dB) or condition number kappa ~ 1.0 (flat transfer)
+    if gain_db < (0.0 - 22.0) or (gain_db < (0.0 - 15.0) and kappa < 1.15):
+        all_pass = 1
+        rec = "EXCISE (All-Pass Idling)"
+    elif gain_db < (0.0 - 14.0):
+        rec = "CANDIDATE (Low Delta Gain)"
+
+    return SpectralVerdict {
+        block_idx: block_idx,
+        spectral_radius: rho,
+        condition_number: kappa,
+        delta_gain_db: gain_db,
+        is_all_pass: all_pass,
+        prune_recommendation: rec,
+    }

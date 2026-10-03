@@ -1,0 +1,98 @@
+// ============================================================================
+// bispectrum_lens.kn — Lens 3: Bispectral Analysis & Quadratic Phase Coupling (QPC)
+//
+// Higher-Order Spectral Analysis (HOSA) over cross-attention and modulation layers:
+//   Normalized Bicoherence (b^2), Quadratic Phase Coupling (QPC), and Intermodulation
+//   Distortion detection. Distinguishes coherent feature binding from hallucination noise.
+// ============================================================================
+
+use std::runtime
+use std::text
+
+pub struct BispectrumVerdict:
+    block_idx: Int
+    bicoherence_sq: Float
+    qpc_phase_coherence: Float
+    distortion_ratio: Float
+    verdict: String
+
+// 8-point DFT for fast bispectral triad estimation
+pub fn dft8_real(signal: Array<Float>, k: Int) -> Float:
+    var sum: Float = 0.0
+    var n: Int = 0
+    while n < 8:
+        let angle: Float = (TWO_PI * (k as Float) * (n as Float)) / 8.0
+        sum = sum + signal[n % len(signal)] * math_cos(angle)
+        n = n + 1
+    return sum
+
+pub fn dft8_imag(signal: Array<Float>, k: Int) -> Float:
+    var sum: Float = 0.0
+    var n: Int = 0
+    while n < 8:
+        let angle: Float = (TWO_PI * (k as Float) * (n as Float)) / 8.0
+        sum = sum - signal[n % len(signal)] * math_sin(angle)
+        n = n + 1
+    return sum
+
+pub fn evaluate_bispectrum_block(block_idx: Int, sample: Array<Float>) -> BispectrumVerdict:
+    if len(sample) < 16:
+        return BispectrumVerdict {
+            block_idx: block_idx,
+            bicoherence_sq: 0.5,
+            qpc_phase_coherence: 0.5,
+            distortion_ratio: 0.1,
+            verdict: "INSUFFICIENT DATA",
+        }
+
+    // Evaluate triad (f1=1, f2=2 -> f1+f2=3)
+    let re1: Float = dft8_real(sample, 1)
+    let im1: Float = dft8_imag(sample, 1)
+    let p1: Float = re1 * re1 + im1 * im1 + 0.000001
+
+    let re2: Float = dft8_real(sample, 2)
+    let im2: Float = dft8_imag(sample, 2)
+    let p2: Float = re2 * re2 + im2 * im2 + 0.000001
+
+    let re3: Float = dft8_real(sample, 3)
+    let im3: Float = dft8_imag(sample, 3)
+    let p3: Float = re3 * re3 + im3 * im3 + 0.000001
+
+    // Product X(f1) * X(f2)
+    // (re1 + j*im1) * (re2 + j*im2) = (re1*re2 - im1*im2) + j*(re1*im2 + im1*re2)
+    let prod_re: Float = re1 * re2 - im1 * im2
+    let prod_im: Float = re1 * im2 + im1 * re2
+
+    // Conjugate X*(f1+f2) = (re3 - j*im3)
+    // Bispectrum B = prod * X* = (prod_re*re3 + prod_im*im3) + j*(prod_im*re3 - prod_re*im3)
+    let bisp_re: Float = prod_re * re3 + prod_im * im3
+    let bisp_im: Float = prod_im * re3 - prod_re * im3
+    let bisp_mag_sq: Float = bisp_re * bisp_re + bisp_im * bisp_im
+
+    // Normalized Bicoherence b^2 = |B|^2 / (P1 * P2 * P3)
+    let denom: Float = p1 * p2 * p3
+    var b_sq: Float = bisp_mag_sq / denom
+    if b_sq > 1.0:
+        b_sq = 1.0
+    if b_sq < 0.0:
+        b_sq = 0.0
+
+    // Distortion ratio: out-of-band energy vs triad energy
+    let re4: Float = dft8_real(sample, 4)
+    let im4: Float = dft8_imag(sample, 4)
+    let p4: Float = re4 * re4 + im4 * im4
+    let dist_ratio: Float = p4 / (p1 + p2 + p3 + 0.000001)
+
+    var v: String = "HARMONIC LOCK (Clean)"
+    if b_sq < 0.04 and dist_ratio > 0.4:
+        v = "HIGH INTERMODULATION DISTORTION"
+    elif b_sq < 0.08:
+        v = "WEAK PHASE COUPLING"
+
+    return BispectrumVerdict {
+        block_idx: block_idx,
+        bicoherence_sq: b_sq,
+        qpc_phase_coherence: math_sqrt(b_sq),
+        distortion_ratio: dist_ratio,
+        verdict: v,
+    }

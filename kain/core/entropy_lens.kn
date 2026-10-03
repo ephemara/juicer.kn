@@ -1,0 +1,168 @@
+// ============================================================================
+// entropy_lens.kn — Lens 2: Permutation Entropy Velocity & LZ76 Complexity
+//
+// Evaluates ordinal pattern distributions, Shannon permutation entropy H_PE,
+// entropy velocity dH/dl across layers, and Kaspar-Schuster LZ76 complexity.
+// Identifies computational idling (dH/dl ~ 0) where layers recirculate latents.
+// ============================================================================
+
+use std::runtime
+use std::text
+
+pub struct EntropyVerdict:
+    block_idx: Int
+    perm_entropy: Float
+    entropy_velocity: Float
+    lz_complexity: Float
+    is_idling: Int
+    prune_recommendation: String
+
+// 3D Ordinal Lehmer permutation code (3! = 6 patterns: 0..5)
+pub fn lehmer3_code(x0: Float, x1: Float, x2: Float) -> Int:
+    if x0 <= x1 and x1 <= x2:
+        return 0 // 0-1-2
+    if x0 <= x2 and x2 <= x1:
+        return 1 // 0-2-1
+    if x1 <= x0 and x0 <= x2:
+        return 2 // 1-0-2
+    if x1 <= x2 and x2 <= x0:
+        return 3 // 1-2-0
+    if x2 <= x0 and x0 <= x1:
+        return 4 // 2-0-1
+    return 5     // 2-1-0
+
+pub fn compute_perm_entropy(sample: Array<Float>) -> Float:
+    let n: Int = len(sample)
+    if n < 6:
+        return 1.0
+
+    var counts: Array<Int> = [0, 0, 0, 0, 0, 0]
+    var total_patterns: Int = 0
+
+    var i: Int = 0
+    while i + 2 < n:
+        let code: Int = lehmer3_code(sample[i], sample[i + 1], sample[i + 2])
+        counts[code] = counts[code] + 1
+        total_patterns = total_patterns + 1
+        i = i + 1
+
+    if total_patterns == 0:
+        return 1.0
+
+    // Shannon entropy: H = - sum(p * ln(p)) / ln(6)
+    // ln(6) = 1.791759
+    let tot_f: Float = total_patterns as Float
+    var h: Float = 0.0
+    var ci: Int = 0
+    while ci < 6:
+        let c: Int = counts[ci]
+        if c > 0:
+            let p: Float = (c as Float) / tot_f
+            // ln(p) approximation
+            var x: Float = p
+            var l2: Float = 0.0
+            while x < 0.5:
+                x = x * 2.0
+                l2 = l2 - 0.693147
+            let t: Float = (x - 1.0) / (x + 1.0)
+            let ln_x: Float = 2.0 * (t + (t * t * t) / 3.0)
+            let ln_p: Float = l2 + ln_x
+            h = h - p * ln_p
+        ci = ci + 1
+
+    let norm_h: Float = h / 1.791759
+    if norm_h > 1.0:
+        return 1.0
+    if norm_h < 0.0:
+        return 0.0
+    return norm_h
+
+pub fn compute_lz76_complexity(sample: Array<Float>) -> Float:
+    let n: Int = len(sample)
+    if n < 8:
+        return 1.0
+    
+    // Mean calculation for thresholding
+    var sum: Float = 0.0
+    var i: Int = 0
+    while i < n:
+        sum = sum + sample[i]
+        i = i + 1
+    let mean: Float = sum / (n as Float)
+
+    // Binarize sample against mean
+    var bits: Array<Int> = []
+    var bi: Int = 0
+    while bi < n:
+        if sample[bi] >= mean:
+            push(bits, 1)
+        else:
+            push(bits, 0)
+        bi = bi + 1
+
+    // Kaspar-Schuster LZ76 parsing count
+    var c: Int = 1
+    var l: Int = 1
+    var k: Int = 1
+    var k_max: Int = 1
+
+    while l + k <= n:
+        // Check if substring bits[l .. l+k-1] appears in bits[0 .. l+k-2]
+        var found: Int = 0
+        var start: Int = 0
+        while start < l:
+            var is_match: Int = 1
+            var m: Int = 0
+            while m < k:
+                if bits[start + m] != bits[l + m]:
+                    is_match = 0
+                    break
+                m = m + 1
+            if is_match == 1:
+                found = 1
+                break
+            start = start + 1
+
+        if found == 1:
+            k = k + 1
+            if k > k_max:
+                k_max = k
+        else:
+            c = c + 1
+            l = l + k
+            k = 1
+            k_max = 1
+
+    // Theoretical maximum complexity b(n) = n / log2(n)
+    // For n ~ 64, b(n) ~ 10.66
+    let bn: Float = (n as Float) / 6.0
+    var norm_lz: Float = (c as Float) / bn
+    if norm_lz > 1.2:
+        norm_lz = 1.2
+    return norm_lz
+
+pub fn evaluate_entropy_block(block_idx: Int, prev_h: Float, sample: Array<Float>) -> EntropyVerdict:
+    let h_pe: Float = compute_perm_entropy(sample)
+    var v_h: Float = 0.0
+    if prev_h >= 0.0:
+        v_h = h_pe - prev_h
+    let lz: Float = compute_lz76_complexity(sample)
+
+    var idling: Int = 0
+    var rec: String = "ACTIVE"
+
+    // If velocity dH/dl is nearly zero (|dH| < 0.012) and LZ complexity is high (unstructured recirculation)
+    if prev_h >= 0.0 and math_abs(v_h) < 0.012:
+        idling = 1
+        rec = "EXCISE (Idle Recirculation)"
+    elif prev_h >= 0.0 and math_abs(v_h) < 0.025:
+        rec = "CANDIDATE (Low Velocity)"
+
+    return EntropyVerdict {
+        block_idx: block_idx,
+        perm_entropy: h_pe,
+        entropy_velocity: v_h,
+        lz_complexity: lz,
+        is_idling: idling,
+        prune_recommendation: rec,
+    }
