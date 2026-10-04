@@ -1,9 +1,13 @@
 // ============================================================================
 // entropy_lens.kn — Lens 2: Permutation Entropy Velocity & LZ76 Complexity
 //
-// Evaluates ordinal pattern distributions, Shannon permutation entropy H_PE,
-// entropy velocity dH/dl across layers, and Kaspar-Schuster LZ76 complexity.
-// Identifies computational idling (dH/dl ~ 0) where layers recirculate latents.
+// Evaluates ordinal pattern distributions via 5D Lehmer codes (120 factoradic bins),
+// Shannon permutation entropy H_PE, Jensen-Shannon statistical complexity C_JS
+// (Rosso et al. 2007 Complexity-Entropy plane), entropy velocity dH/dl across layers,
+// and Kaspar-Schuster LZ76 algorithmic complexity.
+//
+// Identifies computational idling (dH/dl ~ 0, C_JS ~ 0) where layers recirculate latents.
+// Ported from TurboKain perm_entropy.kn.
 // ============================================================================
 
 use std::runtime
@@ -13,71 +17,150 @@ pub struct EntropyVerdict:
     block_idx: Int
     perm_entropy: Float
     entropy_velocity: Float
+    js_complexity: Float
     lz_complexity: Float
     is_idling: Int
     prune_recommendation: String
 
-// 3D Ordinal Lehmer permutation code (3! = 6 patterns: 0..5)
-pub fn lehmer3_code(x0: Float, x1: Float, x2: Float) -> Int:
-    if x0 <= x1 and x1 <= x2:
-        return 0 // 0-1-2
-    if x0 <= x2 and x2 <= x1:
-        return 1 // 0-2-1
-    if x1 <= x0 and x0 <= x2:
-        return 2 // 1-0-2
-    if x1 <= x2 and x2 <= x0:
-        return 3 // 1-2-0
-    if x2 <= x0 and x0 <= x1:
-        return 4 // 2-0-1
-    return 5     // 2-1-0
+const LOG2_120: Float = 6.906890595608519
+const Q0_JS: Float = 1.0360707166862029
+const INV_LN2: Float = 1.4426950408889634
+const P_E_120: Float = 0.008333333333333333
 
-pub fn compute_perm_entropy(sample: Array<Float>) -> Float:
+// 5D Ordinal Lehmer code (5! = 120 patterns: 0..119)
+fn lehmer5_spec(v0: Float, v1: Float, v2: Float, v3: Float, v4: Float) -> Int with Pure:
+    var r0: Int = 0
+    var r1: Int = 0
+    var r2: Int = 0
+    var r3: Int = 0
+    var r4: Int = 0
+
+    if v1 < v0: r0 = r0 + 1
+    else: r1 = r1 + 1
+
+    if v2 < v0: r0 = r0 + 1
+    else: r2 = r2 + 1
+
+    if v3 < v0: r0 = r0 + 1
+    else: r3 = r3 + 1
+
+    if v4 < v0: r0 = r0 + 1
+    else: r4 = r4 + 1
+
+    if v2 < v1: r1 = r1 + 1
+    else: r2 = r2 + 1
+
+    if v3 < v1: r1 = r1 + 1
+    else: r3 = r3 + 1
+
+    if v4 < v1: r1 = r1 + 1
+    else: r4 = r4 + 1
+
+    if v3 < v2: r2 = r2 + 1
+    else: r3 = r3 + 1
+
+    if v4 < v2: r2 = r2 + 1
+    else: r4 = r4 + 1
+
+    if v4 < v3: r3 = r3 + 1
+    else: r4 = r4 + 1
+
+    var c0: Int = 0
+    if r1 < r0: c0 = c0 + 1
+    if r2 < r0: c0 = c0 + 1
+    if r3 < r0: c0 = c0 + 1
+    if r4 < r0: c0 = c0 + 1
+
+    var c1: Int = 0
+    if r2 < r1: c1 = c1 + 1
+    if r3 < r1: c1 = c1 + 1
+    if r4 < r1: c1 = c1 + 1
+
+    var c2: Int = 0
+    if r3 < r2: c2 = c2 + 1
+    if r4 < r2: c2 = c2 + 1
+
+    var c3: Int = 0
+    if r4 < r3: c3 = c3 + 1
+
+    return c0 * 24 + c1 * 6 + c2 * 2 + c3
+
+converge lehmer5(v0: Float, v1: Float, v2: Float, v3: Float, v4: Float) -> Int:
+    spec reference:
+        return lehmer5_spec(v0, v1, v2, v3, v4)
+    fast branchless_lane:
+        return lehmer5_spec(v0, v1, v2, v3, v4)
+    verify random(8)
+
+// Computes 5D Permutation Entropy and Jensen-Shannon complexity over 120 factoradic bins
+pub fn compute_perm_entropy_5d(sample: Array<Float>, out_hc: ptr<Float>) -> Int with Unsafe:
     let n: Int = len(sample)
-    if n < 6:
-        return 1.0
+    if n < 5:
+        mem_store(ptr_offset(out_hc, 0, "Float"), 1.0, "Float")
+        mem_store(ptr_offset(out_hc, 1, "Float"), 0.0, "Float")
+        return 0
 
-    var counts: Array<Int> = [0, 0, 0, 0, 0, 0]
+    let hist: ptr<Int> = alloc_zeroed(120 + 32, "Int")
     var total_patterns: Int = 0
 
     var i: Int = 0
-    while i + 2 < n:
-        let code: Int = lehmer3_code(sample[i], sample[i + 1], sample[i + 2])
-        counts[code] = counts[code] + 1
+    while i + 4 < n:
+        let idx: Int = lehmer5(sample[i], sample[i + 1], sample[i + 2], sample[i + 3], sample[i + 4])
+        let old_cnt: Int = mem_load(ptr_offset(hist, idx, "Int"), "Int")
+        mem_store(ptr_offset(hist, idx, "Int"), old_cnt + 1, "Int")
         total_patterns = total_patterns + 1
         i = i + 1
 
     if total_patterns == 0:
-        return 1.0
+        decay hist
+        mem_store(ptr_offset(out_hc, 0, "Float"), 1.0, "Float")
+        mem_store(ptr_offset(out_hc, 1, "Float"), 0.0, "Float")
+        return 0
 
-    // Shannon entropy: H = - sum(p * ln(p)) / ln(6)
-    // ln(6) = 1.791759
-    let tot_f: Float = total_patterns as Float
-    var h: Float = 0.0
-    var ci: Int = 0
-    while ci < 6:
-        let c: Int = counts[ci]
-        if c > 0:
-            let p: Float = (c as Float) / tot_f
-            // ln(p) approximation
-            var x: Float = p
-            var l2: Float = 0.0
-            while x < 0.5:
-                x = x * 2.0
-                l2 = l2 - 0.693147
-            let t: Float = (x - 1.0) / (x + 1.0)
-            let ln_x: Float = 2.0 * (t + (t * t * t) / 3.0)
-            let ln_p: Float = l2 + ln_x
-            h = h - p * ln_p
-        ci = ci + 1
+    let inv_nv: Float = 1.0 / (total_patterns as Float)
+    var s_p: Float = 0.0
+    var s_m: Float = 0.0
+    var j: Int = 0
+    while j < 120:
+        let cnt: Int = mem_load(ptr_offset(hist, j, "Int"), "Int")
+        var pj: Float = 0.0
+        if cnt > 0:
+            pj = (cnt as Float) * inv_nv
+            s_p = s_p - pj * math_ln(pj) * INV_LN2
+        let mj: Float = 0.5 * (pj + P_E_120)
+        s_m = s_m - mj * math_ln(mj) * INV_LN2
+        j = j + 1
 
-    let norm_h: Float = h / 1.791759
-    if norm_h > 1.0:
-        return 1.0
-    if norm_h < 0.0:
-        return 0.0
-    return norm_h
+    decay hist
 
-pub fn compute_lz76_complexity(sample: Array<Float>) -> Float:
+    var norm_den: Float = LOG2_120
+    if total_patterns > 1:
+        let max_ent: Float = math_ln(total_patterns as Float) * INV_LN2
+        if max_ent < LOG2_120:
+            norm_den = max_ent
+
+    var H: Float = s_p / norm_den
+    if H > 1.0: H = 1.0
+    if H < 0.0: H = 0.0
+
+    let d_js: Float = s_m - 0.5 * s_p - 0.5 * LOG2_120
+    var C: Float = Q0_JS * d_js * H
+    if C < 0.0: C = 0.0
+    if C > 1.0: C = 1.0
+
+    mem_store(ptr_offset(out_hc, 0, "Float"), H, "Float")
+    mem_store(ptr_offset(out_hc, 1, "Float"), C, "Float")
+    return 0
+
+pub fn compute_perm_entropy(sample: Array<Float>) -> Float with Unsafe:
+    let out_hc: ptr<Float> = alloc_zeroed(2 + 32, "Float")
+    let _r: Int = compute_perm_entropy_5d(sample, out_hc)
+    let h_pe: Float = mem_load(ptr_offset(out_hc, 0, "Float"), "Float")
+    decay out_hc
+    return h_pe
+
+// Kaspar-Schuster LZ76 algorithmic complexity parsing
+pub fn compute_lz76_complexity(sample: Array<Float>) -> Float with Unsafe:
     let n: Int = len(sample)
     if n < 8:
         return 1.0
@@ -90,29 +173,54 @@ pub fn compute_lz76_complexity(sample: Array<Float>) -> Float:
         i = i + 1
     let mean: Float = sum / (n as Float)
 
-    // Single pass: transition count
-    var transitions: Int = 0
-    var prev_bit: Int = 0
-    if sample[0] >= mean:
-        prev_bit = 1
-    var j: Int = 1
-    while j < n:
-        var cur_bit: Int = 0
-        if sample[j] >= mean:
-            cur_bit = 1
-        if cur_bit != prev_bit:
-            transitions = transitions + 1
-            prev_bit = cur_bit
-        j = j + 1
+    // Binarize trajectory around mean
+    let b: ptr<Byte> = alloc_zeroed(n + 32, "Byte")
+    var bi: Int = 0
+    while bi < n:
+        if sample[bi] >= mean:
+            bstore(b, bi, 1)
+        else:
+            bstore(b, bi, 0)
+        bi = bi + 1
 
-    let rate: Float = (transitions as Float) / ((n - 1) as Float)
-    let comp: Float = rate * 2.0
-    if comp > 1.2:
-        return 1.2
-    return comp
+    var c: Int = 1
+    var l: Int = 1
+    var k: Int = 1
+    while l + k <= n:
+        var found: Int = 0
+        var p: Int = 0
+        let max_p: Int = l - 1
+        while p <= max_p:
+            var is_matched: Int = 1
+            var j: Int = 0
+            while j < k:
+                if bref(b, p + j) != bref(b, l + j):
+                    is_matched = 0
+                    break
+                j = j + 1
+            if is_matched == 1:
+                found = 1
+                break
+            p = p + 1
+        if found == 1:
+            k = k + 1
+        else:
+            c = c + 1
+            l = l + k
+            k = 1
 
-pub fn evaluate_entropy_block(block_idx: Int, prev_h: Float, sample: Array<Float>) -> EntropyVerdict:
-    let h_pe: Float = compute_perm_entropy(sample)
+    decay b
+
+    let log2_n: Float = math_ln(n as Float) * INV_LN2
+    return ((c as Float) * log2_n) / (n as Float)
+
+pub fn evaluate_entropy_block(block_idx: Int, prev_h: Float, sample: Array<Float>) -> EntropyVerdict with Unsafe:
+    let out_hc: ptr<Float> = alloc_zeroed(2 + 32, "Float")
+    let _r: Int = compute_perm_entropy_5d(sample, out_hc)
+    let h_pe: Float = mem_load(ptr_offset(out_hc, 0, "Float"), "Float")
+    let c_js: Float = mem_load(ptr_offset(out_hc, 1, "Float"), "Float")
+    decay out_hc
+
     var v_h: Float = 0.0
     if prev_h >= 0.0:
         v_h = h_pe - prev_h
@@ -121,8 +229,8 @@ pub fn evaluate_entropy_block(block_idx: Int, prev_h: Float, sample: Array<Float
     var idling: Int = 0
     var rec: String = "ACTIVE"
 
-    // If velocity dH/dl is nearly zero (|dH| < 0.012) and LZ complexity is high (unstructured recirculation)
-    if prev_h >= 0.0 and math_abs(v_h) < 0.012:
+    // If velocity dH/dl is nearly zero (|dH| < 0.015) and complexity is low (idling recirculation)
+    if prev_h >= 0.0 and math_abs(v_h) < 0.015 and c_js < 0.12:
         idling = 1
         rec = "EXCISE (Idle Recirculation)"
     elif prev_h >= 0.0 and math_abs(v_h) < 0.025:
@@ -132,6 +240,7 @@ pub fn evaluate_entropy_block(block_idx: Int, prev_h: Float, sample: Array<Float
         block_idx: block_idx,
         perm_entropy: h_pe,
         entropy_velocity: v_h,
+        js_complexity: c_js,
         lz_complexity: lz,
         is_idling: idling,
         prune_recommendation: rec,

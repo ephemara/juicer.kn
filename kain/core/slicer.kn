@@ -87,6 +87,100 @@ pub fn reindex_tensor_name(orig_name: String, drop_list: Array<Int>) -> String:
             return "layers." + str(new_id) + rest
     return orig_name
 
+pub fn patch_kv_block_count(kv_buf: ptr<Byte>, kv_total_len: Int, kv_count: Int, new_block_count: Int) -> Int with Unsafe:
+    var cur_off: Int = 24
+    var kv_i: Int = 0
+    var patched_count: Int = 0
+
+    while kv_i < kv_count:
+        if cur_off + 16 > kv_total_len:
+            return patched_count
+
+        let klen: Int = read_u64_le(kv_buf, cur_off)
+        cur_off = cur_off + 8
+
+        if cur_off + klen + 4 > kv_total_len:
+            return patched_count
+
+        // Check if key ends with ".block_count" (12 bytes)
+        var is_block_count: Int = 0
+        if klen >= 12:
+            let k_start: Int = cur_off + klen - 12
+            if bref(kv_buf, k_start) == 46:
+                if bref(kv_buf, k_start + 1) == 98:
+                    if bref(kv_buf, k_start + 2) == 108:
+                        if bref(kv_buf, k_start + 3) == 111:
+                            if bref(kv_buf, k_start + 4) == 99:
+                                if bref(kv_buf, k_start + 5) == 107:
+                                    if bref(kv_buf, k_start + 6) == 95:
+                                        if bref(kv_buf, k_start + 7) == 99:
+                                            if bref(kv_buf, k_start + 8) == 111:
+                                                if bref(kv_buf, k_start + 9) == 117:
+                                                    if bref(kv_buf, k_start + 10) == 110:
+                                                        if bref(kv_buf, k_start + 11) == 116:
+                                                            is_block_count = 1
+
+        let val_type: Int = read_u32_le(kv_buf, cur_off + klen)
+        let val_off: Int = cur_off + klen + 4
+
+        if is_block_count == 1:
+            if val_type == 4 or val_type == 5:
+                let old_val: Int = read_u32_le(kv_buf, val_off)
+                write_u32_le(kv_buf, val_off, new_block_count)
+                println(" Slicer: patched *.block_count KV from " + str(old_val) + " to " + str(new_block_count))
+                patched_count = patched_count + 1
+            elif val_type == 10 or val_type == 11:
+                let old_val64: Int = read_u64_le(kv_buf, val_off)
+                write_u64_le(kv_buf, val_off, new_block_count)
+                println(" Slicer: patched *.block_count KV from " + str(old_val64) + " to " + str(new_block_count))
+                patched_count = patched_count + 1
+
+        // Advance past value based on type
+        if val_type == 0 or val_type == 1 or val_type == 7:
+            cur_off = val_off + 1
+        elif val_type == 2 or val_type == 3:
+            cur_off = val_off + 2
+        elif val_type == 4 or val_type == 5 or val_type == 6:
+            cur_off = val_off + 4
+        elif val_type == 8:
+            if val_off + 8 > kv_total_len:
+                return patched_count
+            let slen: Int = read_u64_le(kv_buf, val_off)
+            cur_off = val_off + 8 + slen
+        elif val_type == 10 or val_type == 11 or val_type == 12:
+            cur_off = val_off + 8
+        elif val_type == 9:
+            if val_off + 12 > kv_total_len:
+                return patched_count
+            let item_type: Int = read_u32_le(kv_buf, val_off)
+            let arr_count: Int = read_u64_le(kv_buf, val_off + 4)
+            if item_type == 0 or item_type == 1 or item_type == 7:
+                cur_off = val_off + 12 + arr_count
+            elif item_type == 2 or item_type == 3:
+                cur_off = val_off + 12 + arr_count * 2
+            elif item_type == 4 or item_type == 5 or item_type == 6:
+                cur_off = val_off + 12 + arr_count * 4
+            elif item_type == 10 or item_type == 11 or item_type == 12:
+                cur_off = val_off + 12 + arr_count * 8
+            elif item_type == 8:
+                var elem_off: Int = val_off + 12
+                var ai: Int = 0
+                while ai < arr_count:
+                    if elem_off + 8 > kv_total_len:
+                        return patched_count
+                    let elem_len: Int = read_u64_le(kv_buf, elem_off)
+                    elem_off = elem_off + 8 + elem_len
+                    ai = ai + 1
+                cur_off = elem_off
+            else:
+                return patched_count
+        else:
+            return patched_count
+
+        kv_i = kv_i + 1
+
+    return patched_count
+
 pub fn execute_gguf_slice(model: GgufModel, drop_list: Array<Int>, out_path: String) -> Int with Unsafe:
     println("\n================================================================================")
     println(" juicer.kn — Physical GGUF Slicing Engine")
@@ -151,6 +245,12 @@ pub fn execute_gguf_slice(model: GgufModel, drop_list: Array<Int>, out_path: Str
     // Update tensor count in header (offset 8 in GGUF header) - single 64-bit store (bytes 8..15)
     let st_cnt: Int = len(surviving_tensors)
     mem_store(ptr_offset(kv_buf, 8, "Byte"), st_cnt, "Int")
+
+    // Update *.block_count in KV metadata section
+    var new_b_cnt: Int = model.block_count - len(drop_list)
+    if new_b_cnt < 0:
+        new_b_cnt = 0
+    let _p_kv: Int = patch_kv_block_count(kv_buf, kv_total_len, model.kv_count, new_b_cnt)
 
     // Write original header + KVs with updated tensor count to destination
     let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_total_len)

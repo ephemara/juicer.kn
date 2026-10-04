@@ -34,6 +34,8 @@ fn print_usage():
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
+    println("  quantize <model.gguf> [--type q8_0|q4_0] --out <out.gguf>")
+    println("                                         Native AVX2 GGUF block quantization & compression")
     println("  schedule <model.gguf> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
     println("  prove                                  Run 8-point in-memory formal verification battery")
@@ -63,6 +65,9 @@ fn parse_comma_int_list(csv: String) -> Array<Int>:
     return list
 
 fn run_profile_command(model_path: String) -> Int with Unsafe:
+    if str_ends_with(model_path, ".safetensors") == 1:
+        return run_safetensors_profile_command(model_path)
+
     print_banner()
     println(" [Stage 1/2] Streaming GGUF Tensor Index via kernel32 DMA ...")
     let model: GgufModel = parse_gguf_model(model_path)
@@ -79,9 +84,14 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
     println(" Data Offset:  " + str(model.tensor_data_offset) + " bytes")
 
     println("\n [Stage 2/2] Deploying 4 DSP Analytical Lenses across " + str(model.block_count) + " blocks ...")
-    println("--------------------------------------------------------------------------------")
-    println(" BLK |  SIZE   | SPECTRAL GAIN | CONDITION | PERM ENT | VELOCITY | VERDICT")
-    println("--------------------------------------------------------------------------------")
+    println("---------------------------------------------------------------------------------------------------")
+    println(" BLK |  SIZE   | SPECTRAL GAIN | CONDITION | KURTOSIS | PERM ENT | VELOCITY | BICOHERENCE | VERDICT")
+    println("---------------------------------------------------------------------------------------------------")
+
+    let h_weights: ptr<Void> = k_open_read(model_path)
+    if k_handle_bad(h_weights) == 1:
+        println("profile: failed to open model for weight streaming: " + model_path)
+        return EXIT_ERROR
 
     var prunable_blocks: Array<Int> = []
     var prunable_bytes: Int = 0
@@ -91,20 +101,17 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
     while bi < len(model.blocks):
         let blk: GgufBlock = model.blocks[bi]
         
-        // Generate pseudo-weight harmonic sample based on block index and dimensions
-        var sample: Array<Float> = []
-        var si: Int = 0
-        while si < 64:
-            let fsi: Float = si as Float
-            let fbi: Float = bi as Float
-            // Synthesize block residual transfer frequency characteristic
-            let base_w: Float = math_sin(fsi * 0.15 + fbi * 0.3)
-            let decay_w: Float = 1.0 / (1.0 + (fbi - 18.0) * (fbi - 18.0) * 0.02)
-            push(sample, base_w * decay_w)
-            si = si + 1
+        // Stream real weights from disk via kernel32 DMA
+        var sample: Array<Float> = read_block_weight_sample(h_weights, model, blk.block_idx, 256)
+        if len(sample) < 16:
+            var si: Int = 0
+            while si < 64:
+                push(sample, 0.0)
+                si = si + 1
 
-        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 8)
+        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 16)
         let ent: EntropyVerdict = evaluate_entropy_block(blk.block_idx, prev_h, sample)
+        let bisp: BispectrumVerdict = evaluate_bispectrum_block(blk.block_idx, sample)
         prev_h = ent.perm_entropy
 
         // Formatting block row
@@ -137,6 +144,14 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
             pad = pad - 1
         row = row + " | "
 
+        let kurt_str: String = format_1dp(spec.kurtosis)
+        row = row + kurt_str
+        pad = 8 - len(kurt_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
         let h_str: String = format_2dp(ent.perm_entropy)
         row = row + h_str
         pad = 8 - len(h_str)
@@ -153,20 +168,34 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
             pad = pad - 1
         row = row + " | "
 
+        let b2_str: String = format_2dp(bisp.bicoherence_sq)
+        row = row + b2_str
+        pad = 11 - len(b2_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
         var verdict_str: String = "ACTIVE"
-        if spec.is_all_pass == 1 or ent.is_idling == 1:
+        if spec.kurtosis > 8.0:
+            verdict_str = "PROTECTED (Outlier)"
+        elif spec.is_all_pass == 1 or ent.is_idling == 1:
             verdict_str = "EXCISE (Candidate)"
             push(prunable_blocks, blk.block_idx)
             prunable_bytes = prunable_bytes + blk.total_bytes
         elif spec.delta_gain_db < (0.0 - 15.0):
             verdict_str = "LOW_ENERGY"
+        elif bisp.verdict == "HIGH INTERMODULATION DISTORTION":
+            verdict_str = "NOISY (High IMD)"
 
         row = row + verdict_str
         println(row)
 
         bi = bi + 1
 
-    println("--------------------------------------------------------------------------------")
+    let _c_w: Int = k_CloseHandle(h_weights)
+
+    println("---------------------------------------------------------------------------------------------------")
     println("\n JUICER SUMMARY & ACTIONABLE RECIPE:")
     println(" Redundant Blocks Found:  " + str(len(prunable_blocks)) + " / " + str(model.block_count))
     if len(prunable_blocks) > 0:
@@ -182,6 +211,156 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
         let target_sz: Int = model.file_size - prunable_bytes
         println(" Sliced Model Footprint:  " + format_bytes(target_sz))
         println("\n Next Step -> Run Physical Slicer:")
+        println("   juicer slice " + model_path + " --drop " + drop_arg + " --out juiced_model.gguf\n")
+    else:
+        println(" Model is already tightly optimized (all blocks actively transforming latent geometry).")
+
+    return EXIT_OK
+
+fn run_safetensors_profile_command(model_path: String) -> Int with Unsafe:
+    print_banner()
+    println(" [Stage 1/2] Streaming SafeTensors Directory via kernel32 DMA ...")
+    let model: SafetensorsModel = parse_safetensors_model(model_path)
+    if model.file_size <= 0:
+        println("profile: failed to load safetensors model " + model_path)
+        return EXIT_ERROR
+
+    println(" Loaded:       " + model_path)
+    println(" Format:       Raw Master Weights (Zero Quantization Artifacts)")
+    println(" File Size:    " + format_bytes(model.file_size))
+    println(" Header JSON:  " + format_bytes(model.header_length))
+    println(" Tensors:      " + str(model.tensor_count))
+    println(" Blocks:       " + str(model.block_count))
+    println(" Data Offset:  " + str(model.data_offset) + " bytes")
+
+    println("\n [Stage 2/2] Deploying 4 DSP Analytical Lenses across " + str(model.block_count) + " blocks (Raw Floats) ...")
+    println("---------------------------------------------------------------------------------------------------")
+    println(" BLK |  SIZE   | SPECTRAL GAIN | CONDITION | KURTOSIS | PERM ENT | VELOCITY | BICOHERENCE | VERDICT")
+    println("---------------------------------------------------------------------------------------------------")
+
+    let h_weights: ptr<Void> = k_open_read(model_path)
+    if k_handle_bad(h_weights) == 1:
+        println("profile: failed to open model for weight streaming: " + model_path)
+        return EXIT_ERROR
+
+    var prunable_blocks: Array<Int> = []
+    var prunable_bytes: Int = 0
+    var prev_h: Float = 0.0 - 1.0
+
+    var bi: Int = 0
+    while bi < len(model.blocks):
+        let blk: SafetensorsBlock = model.blocks[bi]
+        
+        // Stream raw unquantized floats from disk via kernel32 DMA
+        var sample: Array<Float> = read_safetensors_weight_sample(h_weights, model, blk.block_idx, 256)
+        if len(sample) < 16:
+            var si: Int = 0
+            while si < 64:
+                push(sample, 0.0)
+                si = si + 1
+
+        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 16)
+        let ent: EntropyVerdict = evaluate_entropy_block(blk.block_idx, prev_h, sample)
+        let bisp: BispectrumVerdict = evaluate_bispectrum_block(blk.block_idx, sample)
+        prev_h = ent.perm_entropy
+
+        // Formatting block row
+        var row: String = " "
+        if blk.block_idx < 10:
+            row = row + " "
+        row = row + str(blk.block_idx) + " | "
+        
+        let sz_str: String = format_bytes(blk.total_bytes)
+        row = row + sz_str
+        var pad: Int = 8 - len(sz_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        let g_str: String = format_1dp(spec.delta_gain_db) + " dB"
+        row = row + g_str
+        pad = 13 - len(g_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        let k_str: String = format_2dp(spec.condition_number)
+        row = row + k_str
+        pad = 9 - len(k_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        let kurt_str: String = format_1dp(spec.kurtosis)
+        row = row + kurt_str
+        pad = 8 - len(kurt_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        let h_str: String = format_2dp(ent.perm_entropy)
+        row = row + h_str
+        pad = 8 - len(h_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        let v_str: String = format_2dp(ent.entropy_velocity)
+        row = row + v_str
+        pad = 8 - len(v_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        let b2_str: String = format_2dp(bisp.bicoherence_sq)
+        row = row + b2_str
+        pad = 11 - len(b2_str)
+        while pad > 0:
+            row = row + " "
+            pad = pad - 1
+        row = row + " | "
+
+        var verdict_str: String = "ACTIVE"
+        if spec.kurtosis > 8.0:
+            verdict_str = "PROTECTED (Outlier)"
+        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+            verdict_str = "EXCISE (Candidate)"
+            push(prunable_blocks, blk.block_idx)
+            prunable_bytes = prunable_bytes + blk.total_bytes
+        elif spec.delta_gain_db < (0.0 - 15.0):
+            verdict_str = "LOW_ENERGY"
+        elif bisp.verdict == "HIGH INTERMODULATION DISTORTION":
+            verdict_str = "NOISY (High IMD)"
+
+        row = row + verdict_str
+        println(row)
+
+        bi = bi + 1
+
+    let _c_w: Int = k_CloseHandle(h_weights)
+
+    println("---------------------------------------------------------------------------------------------------")
+    println("\n JUICER SUMMARY & ACTIONABLE RECIPE (RAW MASTER):")
+    println(" Redundant Blocks Found:  " + str(len(prunable_blocks)) + " / " + str(model.block_count))
+    if len(prunable_blocks) > 0:
+        var drop_arg: String = ""
+        var pi: Int = 0
+        while pi < len(prunable_blocks):
+            if pi > 0:
+                drop_arg = drop_arg + ","
+            drop_arg = drop_arg + str(prunable_blocks[pi])
+            pi = pi + 1
+        println(" Recommended --drop List: " + drop_arg)
+        println(" Est. VRAM Reclaimed:     " + format_bytes(prunable_bytes) + " (" + format_1dp(((prunable_bytes as Float) / (model.file_size as Float)) * 100.0) + "% reduction)")
+        let target_sz: Int = model.file_size - prunable_bytes
+        println(" Sliced Footprint:        " + format_bytes(target_sz))
+        println("\n Next Step -> Run Physical Slicer / Quantizer:")
         println("   juicer slice " + model_path + " --drop " + drop_arg + " --out juiced_model.gguf\n")
     else:
         println(" Model is already tightly optimized (all blocks actively transforming latent geometry).")
@@ -263,6 +442,30 @@ fn main() -> Int with Unsafe:
             return EXIT_ERROR
 
         return execute_gguf_slice(model, drop_list, out_path)
+
+    if cmd == "quantize":
+        if len(args) < 2:
+            println("error: quantize requires a model path. usage: juicer quantize <model.gguf> [--type q8_0|q4_0] --out <quant.gguf>")
+            return EXIT_ERROR
+        let model_path: String = args[1]
+        var target_type: String = "q8_0"
+        var out_path: String = "quantized_model.gguf"
+
+        var i: Int = 2
+        while i < len(args):
+            if args[i] == "--type" and i + 1 < len(args):
+                target_type = args[i + 1]
+                i = i + 1
+            elif args[i] == "--out" and i + 1 < len(args):
+                out_path = args[i + 1]
+                i = i + 1
+            i = i + 1
+
+        let model: GgufModel = parse_gguf_model(model_path)
+        if model.file_size <= 0:
+            println("quantize: failed to load model " + model_path)
+            return EXIT_ERROR
+        return execute_model_quantize(model, target_type, out_path)
 
     if cmd == "schedule":
         if len(args) < 2:

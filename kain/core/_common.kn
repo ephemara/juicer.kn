@@ -121,6 +121,10 @@ pub fn read_u64_le(buf: ptr<Byte>, off: Int) -> Int with Unsafe:
     let hi: Int = read_u32_le(buf, off + 4)
     return lo + (hi << 32)
 
+pub fn write_u16_le(buf: ptr<Byte>, off: Int, val: Int) with Unsafe:
+    bstore(buf, off, val & 255)
+    bstore(buf, off + 1, (val >> 8) & 255)
+
 pub fn write_u32_le(buf: ptr<Byte>, off: Int, val: Int) with Unsafe:
     bstore(buf, off, val & 255)
     bstore(buf, off + 1, (val >> 8) & 255)
@@ -132,6 +136,18 @@ pub fn write_u64_le(buf: ptr<Byte>, off: Int, val: Int) with Unsafe:
     let hi: Int = (val >> 32) & 4294967295
     write_u32_le(buf, off, lo)
     write_u32_le(buf, off + 4, hi)
+
+pub fn write_bin_file(path: String, buf: ptr<Byte>, nbytes: Int) -> Int with Unsafe:
+    let h: ptr<Void> = k_open_write(path)
+    if k_handle_bad(h) == 1:
+        return -1
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let wrote: Int = k_write_all(h, nslot, buf, nbytes)
+    decay nslot
+    let _c: Int = k_CloseHandle(h)
+    if wrote != nbytes:
+        return -1
+    return 0
 
 pub fn f32_from_bits(bits: Int) -> Float with Pure:
     if bits == 0:
@@ -399,3 +415,148 @@ pub fn math_sin(x: Float) -> Float with Pure:
 
 pub fn math_cos(x: Float) -> Float with Pure:
     return math_sin(x + PI * 0.5)
+
+pub fn math_ln(x: Float) -> Float with Pure:
+    if x <= 0.0:
+        return 0.0 - 999999.0
+    var y: Float = x
+    var k: Float = 0.0
+    while y > 1.41421356:
+        y = y * 0.5
+        k = k + 0.6931471805599453
+    while y < 0.70710678:
+        y = y * 2.0
+        k = k - 0.6931471805599453
+    let z: Float = (y - 1.0) / (y + 1.0)
+    let z2: Float = z * z
+    let z3: Float = z * z2
+    let z5: Float = z3 * z2
+    let z7: Float = z5 * z2
+    let s: Float = 2.0 * (z + z3 / 3.0 + z5 / 5.0 + z7 / 7.0)
+    return k + s
+
+pub fn fp32_to_fp16(val: Float) -> Int with Pure:
+    var sign: Int = 0
+    var m: Float = val
+    if m < 0.0:
+        sign = 1
+        m = 0.0 - m
+    if m == 0.0:
+        return sign << 15
+    if m < 0.00006103515625:
+        // Subnormal or underflow
+        let frac: Int = (m / 0.000000059604644775390625) as Int
+        return (sign << 15) | (frac & 1023)
+    if m > 65504.0:
+        // Overflow to inf
+        return (sign << 15) | (31 << 10)
+
+    var e: Int = 0
+    while m >= 2.0:
+        m = m * 0.5
+        e = e + 1
+    while m < 1.0:
+        m = m * 2.0
+        e = e - 1
+
+    let biased_exp: Int = e + 15
+    if biased_exp <= 0:
+        return sign << 15
+    if biased_exp >= 31:
+        return (sign << 15) | (31 << 10)
+
+    let mant: Int = ((m - 1.0) * 1024.0 + 0.5) as Int
+    var final_exp: Int = biased_exp
+    var final_mant: Int = mant
+    if final_mant >= 1024:
+        final_mant = 0
+        final_exp = final_exp + 1
+
+    return (sign << 15) | (final_exp << 10) | (final_mant & 1023)
+
+pub fn fp16_to_fp32(u16: Int) -> Float with Pure:
+    let sign: Int = (u16 >> 15) & 1
+    let exp: Int = (u16 >> 10) & 31
+    let mant: Int = u16 & 1023
+    var sgn: Float = 1.0
+    if sign == 1:
+        sgn = 0.0 - 1.0
+
+    if exp == 0:
+        if mant == 0:
+            return 0.0
+        let frac: Float = (mant as Float) / 1024.0
+        return sgn * frac * 0.00006103515625
+    if exp == 31:
+        return sgn * 65504.0
+
+    let frac: Float = 1.0 + (mant as Float) / 1024.0
+    let shift: Int = exp - 15
+    var p2: Float = 1.0
+    if shift > 0:
+        var si: Int = 0
+        while si < shift:
+            p2 = p2 * 2.0
+            si = si + 1
+    elif shift < 0:
+        var si: Int = 0
+        let neg_shift: Int = 0 - shift
+        while si < neg_shift:
+            p2 = p2 * 0.5
+            si = si + 1
+    return sgn * frac * p2
+
+pub fn bf16_to_fp32(u16: Int) -> Float with Pure:
+    return f32_from_bits(u16 << 16)
+
+pub fn sk_bitrev(re: ptr<Float>, im: ptr<Float>, n: Int) -> Int with Unsafe:
+    var j: Int = 0
+    var i: Int = 1
+    while i < n:
+        var bit: Int = n / 2
+        while bit > 0:
+            if j >= bit:
+                j = j - bit
+                bit = bit / 2
+            else:
+                break
+        j = j + bit
+        if i < j:
+            let tr: Float = mem_load(ptr_offset(re, i, "Float"), "Float")
+            let ti: Float = mem_load(ptr_offset(im, i, "Float"), "Float")
+            mem_store(ptr_offset(re, i, "Float"), mem_load(ptr_offset(re, j, "Float"), "Float"), "Float")
+            mem_store(ptr_offset(im, i, "Float"), mem_load(ptr_offset(im, j, "Float"), "Float"), "Float")
+            mem_store(ptr_offset(re, j, "Float"), tr, "Float")
+            mem_store(ptr_offset(im, j, "Float"), ti, "Float")
+        i = i + 1
+    return 0
+
+pub fn sk_fft(re: ptr<Float>, im: ptr<Float>, n: Int) -> Int with Unsafe:
+    let _b: Int = sk_bitrev(re, im, n)
+    var size: Int = 2
+    while size <= n:
+        let half_size: Int = size / 2
+        let step: Float = (0.0 - TWO_PI) / (size as Float)
+        var i: Int = 0
+        while i < n:
+            var k: Int = 0
+            var j: Int = i
+            while j < i + half_size:
+                let ang: Float = (k as Float) * step
+                let cw: Float = math_cos(ang)
+                let sw: Float = math_sin(ang)
+                let ar: Float = mem_load(ptr_offset(re, j + half_size, "Float"), "Float")
+                let ai: Float = mem_load(ptr_offset(im, j + half_size, "Float"), "Float")
+                let tpre: Float = cw * ar - sw * ai
+                let tpim: Float = sw * ar + cw * ai
+                let xr: Float = mem_load(ptr_offset(re, j, "Float"), "Float")
+                let xi: Float = mem_load(ptr_offset(im, j, "Float"), "Float")
+                mem_store(ptr_offset(re, j, "Float"), xr + tpre, "Float")
+                mem_store(ptr_offset(im, j, "Float"), xi + tpim, "Float")
+                mem_store(ptr_offset(re, j + half_size, "Float"), xr - tpre, "Float")
+                mem_store(ptr_offset(im, j + half_size, "Float"), xi - tpim, "Float")
+                k = k + 1
+                j = j + 1
+            i = i + size
+        size = size * 2
+    return 0

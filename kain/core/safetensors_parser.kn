@@ -1,0 +1,358 @@
+// ============================================================================
+// safetensors_parser.kn — High-speed SafeTensors DMA Header & Tensor Directory Reader
+//
+// Ingests raw unquantized master models (.safetensors, BF16/F16/F32) directly off NVMe.
+// Zero-copy JSON header scanner + kernel32 DMA file streaming.
+// Enables pristine DSP lens analysis and lossless LoRA fusion on raw weights.
+// ============================================================================
+
+use std::runtime
+use std::text
+use std::bytes
+
+pub struct SafetensorsTensor:
+    name: String
+    dtype: String
+    dim0: Int
+    dim1: Int
+    dim2: Int
+    dim3: Int
+    n_dims: Int
+    offset_begin: Int
+    offset_end: Int
+    size_bytes: Int
+    block_idx: Int
+
+pub struct SafetensorsBlock:
+    block_idx: Int
+    tensor_count: Int
+    total_bytes: Int
+
+pub struct SafetensorsModel:
+    path: String
+    file_size: Int
+    header_length: Int
+    data_offset: Int
+    tensor_count: Int
+    block_count: Int
+    tensors: Array<SafetensorsTensor>
+    blocks: Array<SafetensorsBlock>
+
+// Fast zero-copy SafeTensors parser
+pub fn parse_safetensors_model(path: String) -> SafetensorsModel with Unsafe:
+    let empty_tensors: Array<SafetensorsTensor> = []
+    let empty_blocks: Array<SafetensorsBlock> = []
+    let empty_model = SafetensorsModel {
+        path: path,
+        file_size: 0,
+        header_length: 0,
+        data_offset: 0,
+        tensor_count: 0,
+        block_count: 0,
+        tensors: empty_tensors,
+        blocks: empty_blocks,
+    }
+
+    let h: ptr<Void> = k_open_read(path)
+    if k_handle_bad(h) == 1:
+        println("safetensors_parser: failed to open " + path)
+        return empty_model
+
+    let fsz: Int = k_size(h)
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+
+    // 1. Read 8-byte header length prefix
+    let hdr_buf: ptr<Byte> = alloc_zeroed(16 + 32, "Byte")
+    let r_hdr: Int = k_read_at(h, nslot, 0, hdr_buf, 8)
+    if r_hdr < 8:
+        println("safetensors_parser: file too small for header length")
+        decay hdr_buf
+        decay nslot
+        let _c: Int = k_CloseHandle(h)
+        return empty_model
+
+    let hdr_len: Int = read_u64_le(hdr_buf, 0)
+    decay hdr_buf
+
+    if hdr_len <= 0 or hdr_len > fsz:
+        println("safetensors_parser: invalid header length: " + str(hdr_len))
+        decay nslot
+        let _c: Int = k_CloseHandle(h)
+        return empty_model
+
+    // 2. Read full JSON header into memory arena
+    let json_buf: ptr<Byte> = alloc_zeroed(hdr_len + 32, "Byte")
+    let r_json: Int = k_read_at(h, nslot, 8, json_buf, hdr_len)
+    decay nslot
+    let _c: Int = k_CloseHandle(h)
+
+    if r_json < hdr_len:
+        println("safetensors_parser: truncated JSON header read")
+        decay json_buf
+        return empty_model
+
+    let data_start_offset: Int = 8 + hdr_len
+
+    // 3. Scan JSON header for tensor descriptors
+    var tensor_list: Array<SafetensorsTensor> = []
+    var max_block_id: Int = -1
+
+    var idx: Int = 0
+    while idx < hdr_len:
+        // Find next key start '"'
+        while idx < hdr_len and bref(json_buf, idx) != 34:
+            idx = idx + 1
+        if idx >= hdr_len:
+            break
+        idx = idx + 1 // past '"'
+
+        // Extract key name
+        var k_arr: Array<Int> = []
+        while idx < hdr_len and bref(json_buf, idx) != 34:
+            push(k_arr, bref(json_buf, idx))
+            idx = idx + 1
+        idx = idx + 1 // past closing '"'
+
+        let key_str: String = text_from_byte_array(k_arr)
+
+        // Find ':'
+        while idx < hdr_len and bref(json_buf, idx) != 58:
+            idx = idx + 1
+        idx = idx + 1
+
+        // Find value start: if '{', parse tensor object; if not, skip
+        while idx < hdr_len and bref(json_buf, idx) <= 32:
+            idx = idx + 1
+
+        if idx < hdr_len and bref(json_buf, idx) == 123: // '{'
+            // Scan inside tensor dictionary up to matching '}'
+            let obj_start: Int = idx
+            var brace_depth: Int = 1
+            idx = idx + 1
+            while idx < hdr_len and brace_depth > 0:
+                let b: Int = bref(json_buf, idx)
+                if b == 123:
+                    brace_depth = brace_depth + 1
+                elif b == 125:
+                    brace_depth = brace_depth - 1
+                idx = idx + 1
+            let obj_end: Int = idx
+
+            if key_str != "__metadata__":
+                // Parse dtype
+                var dtype_str: String = "BF16"
+                var p_dt: Int = obj_start
+                while p_dt < obj_end - 7:
+                    // search "dtype"
+                    if bref(json_buf, p_dt) == 100 and bref(json_buf, p_dt + 1) == 116 and bref(json_buf, p_dt + 2) == 121 and bref(json_buf, p_dt + 3) == 112 and bref(json_buf, p_dt + 4) == 101:
+                        // find ':' after "dtype"
+                        var dq: Int = p_dt + 5
+                        while dq < obj_end and bref(json_buf, dq) != 58:
+                            dq = dq + 1
+                        // find opening quote of value string
+                        while dq < obj_end and bref(json_buf, dq) != 34:
+                            dq = dq + 1
+                        dq = dq + 1 // past opening quote
+                        var dt_chars: Array<Int> = []
+                        while dq < obj_end and bref(json_buf, dq) != 34:
+                            push(dt_chars, bref(json_buf, dq))
+                            dq = dq + 1
+                        dtype_str = text_from_byte_array(dt_chars)
+                        break
+                    p_dt = p_dt + 1
+
+                // Parse data_offsets: [begin, end]
+                var off_begin: Int = 0
+                var off_end: Int = 0
+                var p_off: Int = obj_start
+                while p_off < obj_end - 12:
+                    if bref(json_buf, p_off) == 100 and bref(json_buf, p_off + 1) == 97 and bref(json_buf, p_off + 2) == 116 and bref(json_buf, p_off + 3) == 97 and bref(json_buf, p_off + 4) == 95 and bref(json_buf, p_off + 5) == 111:
+                        // find '['
+                        var ob: Int = p_off + 6
+                        while ob < obj_end and bref(json_buf, ob) != 91:
+                            ob = ob + 1
+                        ob = ob + 1
+                        // read begin int
+                        while ob < obj_end and bref(json_buf, ob) <= 32:
+                            ob = ob + 1
+                        var b_chars: String = ""
+                        while ob < obj_end and bref(json_buf, ob) != 44 and bref(json_buf, ob) > 32:
+                            b_chars = b_chars + char_at(str(bref(json_buf, ob)), 0) // read digit chars
+                            ob = ob + 1
+                        // comma
+                        while ob < obj_end and bref(json_buf, ob) != 44:
+                            ob = ob + 1
+                        ob = ob + 1
+                        // read end int
+                        while ob < obj_end and bref(json_buf, ob) <= 32:
+                            ob = ob + 1
+                        var e_chars: String = ""
+                        while ob < obj_end and bref(json_buf, ob) != 93 and bref(json_buf, ob) > 32:
+                            e_chars = e_chars + char_at(str(bref(json_buf, ob)), 0)
+                            ob = ob + 1
+
+                        // parse numbers directly from buffer bytes
+                        var num_b: Int = 0
+                        var pb: Int = p_off
+                        while pb < obj_end and bref(json_buf, pb) != 91:
+                            pb = pb + 1
+                        pb = pb + 1
+                        while pb < obj_end and bref(json_buf, pb) <= 32:
+                            pb = pb + 1
+                        while pb < obj_end and bref(json_buf, pb) >= 48 and bref(json_buf, pb) <= 57:
+                            num_b = num_b * 10 + (bref(json_buf, pb) - 48)
+                            pb = pb + 1
+                        while pb < obj_end and bref(json_buf, pb) != 44:
+                            pb = pb + 1
+                        pb = pb + 1
+                        while pb < obj_end and (bref(json_buf, pb) < 48 or bref(json_buf, pb) > 57):
+                            pb = pb + 1
+                        var num_e: Int = 0
+                        while pb < obj_end and bref(json_buf, pb) >= 48 and bref(json_buf, pb) <= 57:
+                            num_e = num_e * 10 + (bref(json_buf, pb) - 48)
+                            pb = pb + 1
+                        off_begin = num_b
+                        off_end = num_e
+                        break
+                    p_off = p_off + 1
+
+                let b_idx: Int = parse_block_index_from_name(key_str)
+                if b_idx > max_block_id:
+                    max_block_id = b_idx
+
+                let t_item = SafetensorsTensor {
+                    name: key_str,
+                    dtype: dtype_str,
+                    dim0: 0,
+                    dim1: 0,
+                    dim2: 0,
+                    dim3: 0,
+                    n_dims: 2,
+                    offset_begin: off_begin,
+                    offset_end: off_end,
+                    size_bytes: off_end - off_begin,
+                    block_idx: b_idx,
+                }
+                push(tensor_list, t_item)
+
+    decay json_buf
+
+    // Single-pass block census
+    let blk_counts: ptr<Int> = alloc_zeroed(2048, "Int")
+    let blk_bytes: ptr<Int> = alloc_zeroed(2048, "Int")
+
+    var si: Int = 0
+    while si < len(tensor_list):
+        let b: Int = tensor_list[si].block_idx
+        if b >= 0 and b < 2048:
+            let cur_c: Int = mem_load(ptr_offset(blk_counts, b, "Int"), "Int")
+            let cur_b: Int = mem_load(ptr_offset(blk_bytes, b, "Int"), "Int")
+            mem_store(ptr_offset(blk_counts, b, "Int"), cur_c + 1, "Int")
+            mem_store(ptr_offset(blk_bytes, b, "Int"), cur_b + tensor_list[si].size_bytes, "Int")
+        si = si + 1
+
+    var block_list: Array<SafetensorsBlock> = []
+    let num_blocks: Int = max_block_id + 1
+    var bi: Int = 0
+    while bi < num_blocks:
+        let cnt: Int = mem_load(ptr_offset(blk_counts, bi, "Int"), "Int")
+        let bsz: Int = mem_load(ptr_offset(blk_bytes, bi, "Int"), "Int")
+        if cnt > 0:
+            let blk = SafetensorsBlock {
+                block_idx: bi,
+                tensor_count: cnt,
+                total_bytes: bsz,
+            }
+            push(block_list, blk)
+        bi = bi + 1
+
+    decay blk_counts
+    decay blk_bytes
+
+    return SafetensorsModel {
+        path: path,
+        file_size: fsz,
+        header_length: hdr_len,
+        data_offset: data_start_offset,
+        tensor_count: len(tensor_list),
+        block_count: len(block_list),
+        tensors: tensor_list,
+        blocks: block_list,
+    }
+
+// Read raw unquantized weight sample via direct kernel32 DMA from Safetensors
+pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, block_idx: Int, max_floats: Int) -> Array<Float> with Unsafe:
+    var sample: Array<Float> = []
+    if k_handle_bad(h) == 1:
+        return sample
+
+    // 1. Locate primary projection tensor for this block
+    var target_idx: Int = -1
+    var first_idx: Int = -1
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: SafetensorsTensor = model.tensors[ti]
+        if t.block_idx == block_idx:
+            if first_idx < 0:
+                first_idx = ti
+            if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0:
+                target_idx = ti
+                break
+        ti = ti + 1
+
+    if target_idx < 0:
+        target_idx = first_idx
+
+    if target_idx < 0:
+        return sample
+
+    let target: SafetensorsTensor = model.tensors[target_idx]
+    let abs_off: Int = model.data_offset + target.offset_begin
+    let tsize: Int = target.size_bytes
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+
+    var bytes_to_read: Int = max_floats * 2
+    if target.dtype == "F32":
+        bytes_to_read = max_floats * 4
+    if bytes_to_read > tsize:
+        bytes_to_read = tsize
+    if bytes_to_read > 65536:
+        bytes_to_read = 65536
+
+    let raw_buf: ptr<Byte> = alloc_zeroed(bytes_to_read + 32, "Byte")
+    let r_act: Int = k_read_at(h, nslot, abs_off, raw_buf, bytes_to_read)
+    decay nslot
+
+    if r_act <= 0:
+        decay raw_buf
+        return sample
+
+    // 2. Decode raw float weights (BF16, F16, F32)
+    if target.dtype == "F32":
+        let num_floats: Int = r_act / 4
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let fval: Float = read_f32_le(raw_buf, fi * 4)
+            push(sample, fval)
+            fi = fi + 1
+    elif target.dtype == "F16":
+        let num_floats: Int = r_act / 2
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+            let fval: Float = fp16_to_fp32(u16_val)
+            push(sample, fval)
+            fi = fi + 1
+    else:
+        // Default BF16 (Hugging Face / Wan 2.1 standard)
+        let num_floats: Int = r_act / 2
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+            let fval: Float = bf16_to_fp32(u16_val)
+            push(sample, fval)
+            fi = fi + 1
+
+    decay raw_buf
+    return sample

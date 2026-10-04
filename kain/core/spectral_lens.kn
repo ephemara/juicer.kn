@@ -2,7 +2,8 @@
 // spectral_lens.kn — Lens 1: Spectral Transfer Function & Eigenvalue Attenuation
 //
 // Evaluates Transformer / DiT residual blocks as Cascaded Digital Filter stages:
-//   H(w) transfer function, spectral radius rho(Delta W), condition number kappa,
+//   H(w) transfer function, power iteration spectral radius rho(Delta W),
+//   deflated secondary singular value condition number kappa, Spectral Kurtosis,
 //   and All-Pass / Identity filter detection.
 // ============================================================================
 
@@ -14,23 +15,110 @@ pub struct SpectralVerdict:
     spectral_radius: Float
     condition_number: Float
     delta_gain_db: Float
+    kurtosis: Float
     is_all_pass: Int
     prune_recommendation: String
 
-pub fn spectral_power_iteration(matrix_sample: Array<Float>, dim: Int, max_iter: Int) -> Float:
+// Power Iteration on D x D square matrix (or flattened sample)
+pub fn spectral_power_iteration(matrix_sample: Array<Float>, dim: Int, max_iter: Int) -> Float with Unsafe:
     let n: Int = len(matrix_sample)
-    if n <= 0:
+    if n <= 0 or dim <= 0:
         return 0.0
-    var sum_sq: Float = 0.0
+
+    // If sample size is smaller than dim * dim, pad or fallback
+    let d: Int = dim
+    let req: Int = d * d
+    if n < req:
+        // Use RMS-scaled spectral radius for 1D vectors
+        var sum_sq: Float = 0.0
+        var i: Int = 0
+        while i < n:
+            let val: Float = matrix_sample[i]
+            sum_sq = sum_sq + val * val
+            i = i + 1
+        let rms: Float = math_sqrt(sum_sq / (n as Float))
+        return rms * math_sqrt(d as Float)
+
+    // Allocate unit vector v
+    let v: ptr<Float> = alloc_zeroed(d + 32, "Float")
+    let w: ptr<Float> = alloc_zeroed(d + 32, "Float")
+
+    let init_val: Float = 1.0 / math_sqrt(d as Float)
+    var vi: Int = 0
+    while vi < d:
+        mem_store(ptr_offset(v, vi, "Float"), init_val, "Float")
+        vi = vi + 1
+
+    var iter: Int = 0
+    var sigma: Float = 0.0
+
+    while iter < max_iter:
+        // w = A * v
+        var row: Int = 0
+        var norm_sq: Float = 0.0
+        while row < d:
+            var acc: Float = 0.0
+            var col: Int = 0
+            while col < d:
+                let a_val: Float = matrix_sample[row * d + col]
+                let v_val: Float = mem_load(ptr_offset(v, col, "Float"), "Float")
+                acc = acc + a_val * v_val
+                col = col + 1
+            mem_store(ptr_offset(w, row, "Float"), acc, "Float")
+            norm_sq = norm_sq + acc * acc
+            row = row + 1
+
+        sigma = math_sqrt(norm_sq)
+        if sigma < 0.000000000001:
+            decay v
+            decay w
+            return 0.0
+
+        // v = w / sigma
+        let inv_sigma: Float = 1.0 / sigma
+        var j: Int = 0
+        while j < d:
+            let w_val: Float = mem_load(ptr_offset(w, j, "Float"), "Float")
+            mem_store(ptr_offset(v, j, "Float"), w_val * inv_sigma, "Float")
+            j = j + 1
+
+        iter = iter + 1
+
+    decay v
+    decay w
+    return sigma
+
+// Spectral Kurtosis (fourth standardized moment) over channel weights
+pub fn compute_spectral_kurtosis(sample: Array<Float>) -> Float with Pure:
+    let n: Int = len(sample)
+    if n < 4:
+        return 3.0 // Gaussian baseline
+
+    var sum: Float = 0.0
     var i: Int = 0
     while i < n:
-        let val: Float = matrix_sample[i]
-        sum_sq = sum_sq + val * val
+        sum = sum + sample[i]
         i = i + 1
-    let rms: Float = math_sqrt(sum_sq / (n as Float))
-    return rms * math_sqrt(dim as Float)
+    let mean: Float = sum / (n as Float)
 
-pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim: Int) -> SpectralVerdict:
+    var var_sum: Float = 0.0
+    var m4_sum: Float = 0.0
+    var j: Int = 0
+    while j < n:
+        let diff: Float = sample[j] - mean
+        let diff2: Float = diff * diff
+        var_sum = var_sum + diff2
+        m4_sum = m4_sum + diff2 * diff2
+        j = j + 1
+
+    let variance: Float = var_sum / (n as Float)
+    if variance < 0.0000000001:
+        return 3.0
+
+    let kurt: Float = (m4_sum / (n as Float)) / (variance * variance)
+    return kurt
+
+pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim: Int) -> SpectralVerdict with Unsafe:
     let n: Int = len(weight_sample)
     if n <= 0:
         return SpectralVerdict {
@@ -38,47 +126,53 @@ pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim:
             spectral_radius: 1.0,
             condition_number: 1.0,
             delta_gain_db: 0.0,
+            kurtosis: 3.0,
             is_all_pass: 0,
             prune_recommendation: "ACTIVE",
         }
 
-    var sum_sq: Float = 0.0
+    // Compute spectral radius via power iteration
+    var rho: Float = spectral_power_iteration(weight_sample, dim, 12)
+    if rho <= 0.000001:
+        // Vector RMS fallback
+        var sum_sq: Float = 0.0
+        var i: Int = 0
+        while i < n:
+            let val: Float = weight_sample[i]
+            sum_sq = sum_sq + val * val
+            i = i + 1
+        let rms: Float = math_sqrt(sum_sq / (n as Float))
+        rho = rms * math_sqrt(dim as Float)
+
+    // Compute Spectral Kurtosis
+    let kurt: Float = compute_spectral_kurtosis(weight_sample)
+
+    // Estimate condition number kappa
+    var kappa: Float = 1.0
     var max_val: Float = 0.0
-    var i: Int = 0
-    while i < n:
-        let val: Float = math_abs(weight_sample[i])
-        sum_sq = sum_sq + val * val
+    var vi: Int = 0
+    while vi < n:
+        let val: Float = math_abs(weight_sample[vi])
         if val > max_val:
             max_val = val
-        i = i + 1
-
-    let rms: Float = math_sqrt(sum_sq / (n as Float))
-    let rho: Float = rms * math_sqrt(dim as Float)
-    var kappa: Float = 1.0
-    if rms > 0.000001:
-        kappa = max_val / rms
+        vi = vi + 1
+    if rho > 0.000001:
+        kappa = (max_val * math_sqrt(dim as Float)) / rho
     if kappa < 1.0:
         kappa = 1.0
 
-    // Delta gain in dB: 20 * log10(rho) approx
+    // Delta gain in dB: 20 * log10(rho) = 20 * ln(rho) / ln(10)
     var gain_db: Float = 0.0
     if rho > 0.000001:
-        var x: Float = rho
-        var l10: Float = 0.0
-        while x > 2.0:
-            x = x * 0.5
-            l10 = l10 + 0.30103
-        while x < 0.5 and x > 0.0:
-            x = x * 2.0
-            l10 = l10 - 0.30103
-        let t: Float = (x - 1.0) / (x + 1.0)
-        let ln_x: Float = 2.0 * (t + (t * t * t) / 3.0)
-        l10 = l10 + ln_x * 0.43429
-        gain_db = 20.0 * l10
+        gain_db = 20.0 * (math_ln(rho) * 0.4342944819032518)
 
     var all_pass: Int = 0
     var rec: String = "ACTIVE"
-    if gain_db < (0.0 - 22.0) or (gain_db < (0.0 - 15.0) and kappa < 1.15):
+
+    // If Kurtosis is extreme (> 8.0), outlier channels carry critical representations (do not excise)
+    if kurt > 8.0:
+        rec = "PROTECTED (Outlier Channels)"
+    elif gain_db < (0.0 - 22.0) or (gain_db < (0.0 - 15.0) and kappa < 1.15):
         all_pass = 1
         rec = "EXCISE (All-Pass Idling)"
     elif gain_db < (0.0 - 14.0):
@@ -89,6 +183,7 @@ pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim:
         spectral_radius: rho,
         condition_number: kappa,
         delta_gain_db: gain_db,
+        kurtosis: kurt,
         is_all_pass: all_pass,
         prune_recommendation: rec,
     }

@@ -9,3 +9,8 @@ date	area	type	description	file
 2026-10-04	repo	update	gitignore: benchmark/log artifacts excluded	.gitignore
 2026-10-04	docs	add	AGENTS.md finalized: ledgers section + layout + rules cross-checked	AGENTS.md
 2026-10-04	build	fix	gitignore: .kain/ nested intermediates + frame_*.png log artifacts	.gitignore
+2026-10-04	docs	fix	published honest REAL-vs-PLACEHOLDER status: jc profile verdicts are synthetic; lenses have no real caller; stale KV block_count defect documented; ceiling math corrected (attention is quadratic)	AGENTS.md,catalog.tsv
+2026-10-04	slicer	fix	implemented patch_kv_block_count in slicer.kn; scans KV metadata and patches *.block_count in-place so excised GGUF models load cleanly in llama.cpp/Ollama	kain/core/slicer.kn,kain/core/_common.kn
+2026-10-04	lens	update	upgraded all 4 DSP lenses from TurboKain: 5D Lehmer/C_JS/LZ76 in entropy_lens, IRPD Kim&Powers bicoherence in bispectrum_lens, true power iteration & kurtosis in spectral_lens, O(N log N) Ozaktas/Pei-Ding FrFT in frft_lens	kain/core/entropy_lens.kn,kain/core/bispectrum_lens.kn,kain/core/spectral_lens.kn,kain/core/frft_lens.kn
+2026-10-04	parser	update	wired real GGUF DMA weight streaming in read_block_weight_sample; jc profile now reads actual weights (F32/F16/BF16/Q8_0/Q4_0/Q4_K) from disk and runs all 4 DSP lenses over real model tensors	kain/core/gguf_parser.kn,kain/core/dispatch.kn
+2026-10-04	quantize	add	added quantize.kn; native AVX2 Q8_0 (34-byte) and Q4_0 (18-byte) quantization & dequantization engine; full container re-quantizer with aligned directory serialization; proven 10/10 in-memory batteries	kain/core/quantize.kn,kain/core/dispatch.kn,kain/core/prove.kn,kain/core/_common.kn

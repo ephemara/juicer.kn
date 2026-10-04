@@ -41,30 +41,51 @@ pub struct GgufModel:
     blocks: Array<GgufBlock>
 
 pub fn parse_block_index_from_name(name: String) -> Int:
-    // Pattern 1: "blocks.<id>." (Wan 2.1, LLaMA, Qwen, etc.)
-    if str_starts_with(name, "blocks.") == 1:
-        let dot2: Int = find_from(name, ".", 7)
-        if dot2 > 7:
-            let num_str: String = text_substring_string(name, 7, dot2 - 7)
+    // Pattern 1: Contains "double_blocks.<id>." (Flux double blocks)
+    let p_dbl: Int = find_from(name, "double_blocks.", 0)
+    if p_dbl >= 0:
+        let s_idx: Int = p_dbl + 14
+        let dot2: Int = find_from(name, ".", s_idx)
+        if dot2 > s_idx:
+            let num_str: String = text_substring_string(name, s_idx, dot2 - s_idx)
             return parse_int_text(num_str)
-    // Pattern 2: "double_blocks.<id>." (Flux double blocks)
-    if str_starts_with(name, "double_blocks.") == 1:
-        let dot2: Int = find_from(name, ".", 14)
-        if dot2 > 14:
-            let num_str: String = text_substring_string(name, 14, dot2 - 14)
+
+    // Pattern 2: Contains "single_blocks.<id>." (Flux single blocks)
+    let p_sng: Int = find_from(name, "single_blocks.", 0)
+    if p_sng >= 0:
+        let s_idx: Int = p_sng + 14
+        let dot2: Int = find_from(name, ".", s_idx)
+        if dot2 > s_idx:
+            let num_str: String = text_substring_string(name, s_idx, dot2 - s_idx)
+            return parse_int_text(num_str) + 1000
+
+    // Pattern 3: Contains "blocks.<id>." (Wan 2.1, LLaMA, ComfyUI, etc.)
+    let p_blk: Int = find_from(name, "blocks.", 0)
+    if p_blk >= 0:
+        let s_idx: Int = p_blk + 7
+        let dot2: Int = find_from(name, ".", s_idx)
+        if dot2 > s_idx:
+            let num_str: String = text_substring_string(name, s_idx, dot2 - s_idx)
             return parse_int_text(num_str)
-    // Pattern 3: "single_blocks.<id>." (Flux single blocks)
-    if str_starts_with(name, "single_blocks.") == 1:
-        let dot2: Int = find_from(name, ".", 14)
-        if dot2 > 14:
-            let num_str: String = text_substring_string(name, 14, dot2 - 14)
-            return parse_int_text(num_str) + 1000 // offset single blocks
-    // Pattern 4: "blk.<id>."
-    if str_starts_with(name, "blk.") == 1:
-        let dot2: Int = find_from(name, ".", 4)
-        if dot2 > 4:
-            let num_str: String = text_substring_string(name, 4, dot2 - 4)
+
+    // Pattern 4: Contains "layers.<id>." (HuggingFace LLaMA, Qwen, Mistral)
+    let p_lyr: Int = find_from(name, "layers.", 0)
+    if p_lyr >= 0:
+        let s_idx: Int = p_lyr + 7
+        let dot2: Int = find_from(name, ".", s_idx)
+        if dot2 > s_idx:
+            let num_str: String = text_substring_string(name, s_idx, dot2 - s_idx)
             return parse_int_text(num_str)
+
+    // Pattern 5: "blk.<id>."
+    let p_b: Int = find_from(name, "blk.", 0)
+    if p_b >= 0:
+        let s_idx: Int = p_b + 4
+        let dot2: Int = find_from(name, ".", s_idx)
+        if dot2 > s_idx:
+            let num_str: String = text_substring_string(name, s_idx, dot2 - s_idx)
+            return parse_int_text(num_str)
+
     return -1
 
 pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
@@ -365,3 +386,138 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
         tensors: tensor_list,
         blocks: block_list,
     }
+
+pub fn read_block_weight_sample(h: ptr<Void>, model: GgufModel, block_idx: Int, max_floats: Int) -> Array<Float> with Unsafe:
+    var sample: Array<Float> = []
+    if k_handle_bad(h) == 1:
+        return sample
+
+    // 1. Locate best representative tensor in this block (projection/FFN preferred)
+    var target_idx: Int = -1
+    var first_idx: Int = -1
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: GgufTensor = model.tensors[ti]
+        if t.block_idx == block_idx:
+            if first_idx < 0:
+                first_idx = ti
+            if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0:
+                target_idx = ti
+                break
+        ti = ti + 1
+
+    if target_idx < 0:
+        target_idx = first_idx
+
+    if target_idx < 0:
+        return sample
+
+    let target: GgufTensor = model.tensors[target_idx]
+    let abs_off: Int = model.tensor_data_offset + target.offset
+    let ttype: Int = target.type_id
+    let tsize: Int = target.size_bytes
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+
+    var bytes_to_read: Int = max_floats * 4
+    if bytes_to_read > tsize:
+        bytes_to_read = tsize
+    if bytes_to_read > 65536:
+        bytes_to_read = 65536
+
+    let raw_buf: ptr<Byte> = alloc_zeroed(bytes_to_read + 32, "Byte")
+    let r_act: Int = k_read_at(h, nslot, abs_off, raw_buf, bytes_to_read)
+    decay nslot
+
+    if r_act <= 0:
+        decay raw_buf
+        return sample
+
+    // 2. Decode weights based on tensor type_id
+    if ttype == 0:
+        // F32 (4 bytes per float)
+        let num_floats: Int = r_act / 4
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let fval: Float = read_f32_le(raw_buf, fi * 4)
+            push(sample, fval)
+            fi = fi + 1
+    elif ttype == 1:
+        // F16 (2 bytes per float)
+        let num_floats: Int = r_act / 2
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+            let fval: Float = fp16_to_fp32(u16_val)
+            push(sample, fval)
+            fi = fi + 1
+    elif ttype == 28:
+        // BF16 (2 bytes per float)
+        let num_floats: Int = r_act / 2
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+            let fval: Float = bf16_to_fp32(u16_val)
+            push(sample, fval)
+            fi = fi + 1
+    elif ttype == 8:
+        // Q8_0 (34 bytes per 32 weights: 2 byte fp16 scale + 32 int8 quants)
+        let num_blocks: Int = r_act / 34
+        var bi: Int = 0
+        while bi < num_blocks and len(sample) < max_floats:
+            let scale_u16: Int = read_u16_le(raw_buf, bi * 34)
+            let scale_f: Float = fp16_to_fp32(scale_u16)
+            var qi: Int = 0
+            while qi < 32 and len(sample) < max_floats:
+                let qb: Int = bref(raw_buf, bi * 34 + 2 + qi)
+                var q_signed: Int = qb
+                if q_signed > 127:
+                    q_signed = q_signed - 256
+                push(sample, scale_f * (q_signed as Float))
+                qi = qi + 1
+            bi = bi + 1
+    elif ttype == 2:
+        // Q4_0 (18 bytes per 32 weights: 2 byte fp16 scale + 16 bytes for 32 4-bit nibbles)
+        let num_blocks: Int = r_act / 18
+        var bi: Int = 0
+        while bi < num_blocks and len(sample) < max_floats:
+            let scale_u16: Int = read_u16_le(raw_buf, bi * 18)
+            let scale_f: Float = fp16_to_fp32(scale_u16)
+            var qi: Int = 0
+            while qi < 16 and len(sample) < max_floats:
+                let byte_v: Int = bref(raw_buf, bi * 18 + 2 + qi)
+                let low_nib: Int = byte_v & 15
+                let high_nib: Int = (byte_v >> 4) & 15
+                push(sample, scale_f * ((low_nib - 8) as Float))
+                if len(sample) < max_floats:
+                    push(sample, scale_f * ((high_nib - 8) as Float))
+                qi = qi + 1
+            bi = bi + 1
+    elif ttype == 12:
+        // Q4_K (144 bytes per 256 weights)
+        let num_super_blocks: Int = r_act / 144
+        var sbi: Int = 0
+        while sbi < num_super_blocks and len(sample) < max_floats:
+            let d_u16: Int = read_u16_le(raw_buf, sbi * 144)
+            let d_f: Float = fp16_to_fp32(d_u16)
+            var qi: Int = 0
+            while qi < 128 and len(sample) < max_floats:
+                let byte_v: Int = bref(raw_buf, sbi * 144 + 16 + qi)
+                let q0: Int = byte_v & 15
+                let q1: Int = (byte_v >> 4) & 15
+                push(sample, d_f * ((q0 - 8) as Float))
+                if len(sample) < max_floats:
+                    push(sample, d_f * ((q1 - 8) as Float))
+                qi = qi + 1
+            sbi = sbi + 1
+    else:
+        // Generic byte fallback
+        var raw_i: Int = 0
+        while raw_i < r_act and len(sample) < max_floats:
+            let b_val: Int = bref(raw_buf, raw_i)
+            let fval: Float = ((b_val - 128) as Float) / 128.0
+            push(sample, fval)
+            raw_i = raw_i + 1
+
+    decay raw_buf
+    return sample

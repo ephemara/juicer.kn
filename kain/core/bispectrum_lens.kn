@@ -2,8 +2,12 @@
 // bispectrum_lens.kn — Lens 3: Bispectral Analysis & Quadratic Phase Coupling (QPC)
 //
 // Higher-Order Spectral Analysis (HOSA) over cross-attention and modulation layers:
-//   Normalized Bicoherence (b^2), Quadratic Phase Coupling (QPC), and Intermodulation
-//   Distortion detection. Distinguishes coherent feature binding from hallucination noise.
+//   Kim & Powers (1979) Normalized Bicoherence (b^2) across the Irreducible
+//   Principal Domain (IRPD), Quadratic Phase Coupling (QPC), and Intermodulation
+//   Distortion detection.
+//
+// Distinguishes coherent feature binding from hallucination noise.
+// Ported & adapted from TurboKain bispectrum.kn.
 // ============================================================================
 
 use std::runtime
@@ -16,27 +20,56 @@ pub struct BispectrumVerdict:
     distortion_ratio: Float
     verdict: String
 
-// 8-point DFT for fast bispectral triad estimation
+// 8-point DFT for micro triad estimation fallback
 pub fn dft8_real(signal: Array<Float>, k: Int) -> Float:
     var sum: Float = 0.0
     var n: Int = 0
+    let slen: Int = len(signal)
     while n < 8:
         let angle: Float = (TWO_PI * (k as Float) * (n as Float)) / 8.0
-        sum = sum + signal[n % len(signal)] * math_cos(angle)
+        sum = sum + signal[n % slen] * math_cos(angle)
         n = n + 1
     return sum
 
 pub fn dft8_imag(signal: Array<Float>, k: Int) -> Float:
     var sum: Float = 0.0
     var n: Int = 0
+    let slen: Int = len(signal)
     while n < 8:
         let angle: Float = (TWO_PI * (k as Float) * (n as Float)) / 8.0
-        sum = sum - signal[n % len(signal)] * math_sin(angle)
+        sum = sum - signal[n % slen] * math_sin(angle)
         n = n + 1
     return sum
 
-pub fn evaluate_bispectrum_block(block_idx: Int, sample: Array<Float>) -> BispectrumVerdict:
-    if len(sample) < 16:
+// Converge kernels for cross-triad bispectrum accumulation
+fn bisp_term_re_spec(r1: Float, i1: Float, r2: Float, i2: Float, r3: Float, i3: Float) -> Float with Pure:
+    let ar: Float = r1 * r2 - i1 * i2
+    let ai: Float = r1 * i2 + i1 * r2
+    return ar * r3 + ai * i3
+
+converge bisp_term_re(r1: Float, i1: Float, r2: Float, i2: Float, r3: Float, i3: Float) -> Float:
+    spec reference:
+        return bisp_term_re_spec(r1, i1, r2, i2, r3, i3)
+    fast branchless_lane:
+        return bisp_term_re_spec(r1, i1, r2, i2, r3, i3)
+    verify random(8)
+
+fn bisp_term_im_spec(r1: Float, i1: Float, r2: Float, i2: Float, r3: Float, i3: Float) -> Float with Pure:
+    let ar: Float = r1 * r2 - i1 * i2
+    let ai: Float = r1 * i2 + i1 * r2
+    return ai * r3 - ar * i3
+
+converge bisp_term_im(r1: Float, i1: Float, r2: Float, i2: Float, r3: Float, i3: Float) -> Float:
+    spec reference:
+        return bisp_term_im_spec(r1, i1, r2, i2, r3, i3)
+    fast branchless_lane:
+        return bisp_term_im_spec(r1, i1, r2, i2, r3, i3)
+    verify random(8)
+
+// Full IRPD (Irreducible Principal Domain) Kim & Powers 1979 Normalized Bicoherence Engine
+pub fn evaluate_bispectrum_block(block_idx: Int, sample: Array<Float>) -> BispectrumVerdict with Unsafe:
+    let n_total: Int = len(sample)
+    if n_total < 16:
         return BispectrumVerdict {
             block_idx: block_idx,
             bicoherence_sq: 0.5,
@@ -45,54 +78,134 @@ pub fn evaluate_bispectrum_block(block_idx: Int, sample: Array<Float>) -> Bispec
             verdict: "INSUFFICIENT DATA",
         }
 
-    // Evaluate triad (f1=1, f2=2 -> f1+f2=3)
-    let re1: Float = dft8_real(sample, 1)
-    let im1: Float = dft8_imag(sample, 1)
-    let p1: Float = re1 * re1 + im1 * im1 + 0.000001
+    let n_fft: Int = 16
+    let k_max: Int = n_fft / 2 // 8 bins
+    let m_blocks: Int = n_total / n_fft
+    if m_blocks <= 0:
+        return BispectrumVerdict {
+            block_idx: block_idx,
+            bicoherence_sq: 0.0,
+            qpc_phase_coherence: 0.0,
+            distortion_ratio: 0.5,
+            verdict: "WEAK PHASE COUPLING",
+        }
 
-    let re2: Float = dft8_real(sample, 2)
-    let im2: Float = dft8_imag(sample, 2)
-    let p2: Float = re2 * re2 + im2 * im2 + 0.000001
+    // Segment FFT buffers
+    let spec_sz: Int = m_blocks * (k_max + 1)
+    let spec_r: ptr<Float> = alloc_zeroed(spec_sz + 32, "Float")
+    let spec_i: ptr<Float> = alloc_zeroed(spec_sz + 32, "Float")
+    let spec_p: ptr<Float> = alloc_zeroed(spec_sz + 32, "Float")
 
-    let re3: Float = dft8_real(sample, 3)
-    let im3: Float = dft8_imag(sample, 3)
-    let p3: Float = re3 * re3 + im3 * im3 + 0.000001
+    let fft_r: ptr<Float> = alloc_zeroed(n_fft + 32, "Float")
+    let fft_i: ptr<Float> = alloc_zeroed(n_fft + 32, "Float")
 
-    // Product X(f1) * X(f2)
-    // (re1 + j*im1) * (re2 + j*im2) = (re1*re2 - im1*im2) + j*(re1*im2 + im1*re2)
-    let prod_re: Float = re1 * re2 - im1 * im2
-    let prod_im: Float = re1 * im2 + im1 * re2
+    // 1. Compute Hann-windowed FFTs across segments
+    var blk: Int = 0
+    while blk < m_blocks:
+        let in_off: Int = blk * n_fft
+        var wi: Int = 0
+        while wi < n_fft:
+            let w_val: Float = 0.5 * (1.0 - math_cos((TWO_PI * (wi as Float)) / (n_fft as Float)))
+            let s_val: Float = sample[in_off + wi] * w_val
+            mem_store(ptr_offset(fft_r, wi, "Float"), s_val, "Float")
+            mem_store(ptr_offset(fft_i, wi, "Float"), 0.0, "Float")
+            wi = wi + 1
 
-    // Conjugate X*(f1+f2) = (re3 - j*im3)
-    // Bispectrum B = prod * X* = (prod_re*re3 + prod_im*im3) + j*(prod_im*re3 - prod_re*im3)
-    let bisp_re: Float = prod_re * re3 + prod_im * im3
-    let bisp_im: Float = prod_im * re3 - prod_re * im3
-    let bisp_mag_sq: Float = bisp_re * bisp_re + bisp_im * bisp_im
+        let _f: Int = sk_fft(fft_r, fft_i, n_fft)
 
-    // Normalized Bicoherence b^2 = |B|^2 / (P1 * P2 * P3)
-    let denom: Float = p1 * p2 * p3
-    var b_sq: Float = bisp_mag_sq / denom
-    if b_sq > 1.0:
-        b_sq = 1.0
-    if b_sq < 0.0:
-        b_sq = 0.0
+        var k: Int = 0
+        while k <= k_max:
+            let r: Float = mem_load(ptr_offset(fft_r, k, "Float"), "Float")
+            let im: Float = mem_load(ptr_offset(fft_i, k, "Float"), "Float")
+            let p: Float = r * r + im * im
+            let dst_off: Int = blk * (k_max + 1) + k
+            mem_store(ptr_offset(spec_r, dst_off, "Float"), r, "Float")
+            mem_store(ptr_offset(spec_i, dst_off, "Float"), im, "Float")
+            mem_store(ptr_offset(spec_p, dst_off, "Float"), p, "Float")
+            k = k + 1
+        blk = blk + 1
 
-    // Distortion ratio: out-of-band energy vs triad energy
-    let re4: Float = dft8_real(sample, 4)
-    let im4: Float = dft8_imag(sample, 4)
-    let p4: Float = re4 * re4 + im4 * im4
-    let dist_ratio: Float = p4 / (p1 + p2 + p3 + 0.000001)
+    decay fft_r
+    decay fft_i
+
+    // 2. Scan IRPD domain: 0 <= k2 <= k1, k1 + k2 <= k_max
+    var max_b2: Float = 0.0
+    var total_coupled_power: Float = 0.0
+    var total_spectral_power: Float = 0.0
+
+    var k1: Int = 1
+    while k1 < k_max:
+        var k2: Int = 1
+        while k2 <= k1:
+            let k3: Int = k1 + k2
+            if k3 <= k_max:
+                // Accumulate bispectrum over m_blocks
+                var sum_re: Float = 0.0
+                var sum_im: Float = 0.0
+                var d12: Float = 0.0
+                var d3: Float = 0.0
+
+                var m: Int = 0
+                while m < m_blocks:
+                    let stride: Int = k_max + 1
+                    let off1: Int = m * stride + k1
+                    let off2: Int = m * stride + k2
+                    let off3: Int = m * stride + k3
+
+                    let r1: Float = mem_load(ptr_offset(spec_r, off1, "Float"), "Float")
+                    let i1: Float = mem_load(ptr_offset(spec_i, off1, "Float"), "Float")
+                    let r2: Float = mem_load(ptr_offset(spec_r, off2, "Float"), "Float")
+                    let i2: Float = mem_load(ptr_offset(spec_i, off2, "Float"), "Float")
+                    let r3: Float = mem_load(ptr_offset(spec_r, off3, "Float"), "Float")
+                    let i3: Float = mem_load(ptr_offset(spec_i, off3, "Float"), "Float")
+
+                    let p1: Float = mem_load(ptr_offset(spec_p, off1, "Float"), "Float")
+                    let p2: Float = mem_load(ptr_offset(spec_p, off2, "Float"), "Float")
+                    let p3: Float = mem_load(ptr_offset(spec_p, off3, "Float"), "Float")
+
+                    let tre: Float = bisp_term_re(r1, i1, r2, i2, r3, i3)
+                    let tim: Float = bisp_term_im(r1, i1, r2, i2, r3, i3)
+
+                    sum_re = sum_re + tre
+                    sum_im = sum_im + tim
+                    d12 = d12 + p1 * p2
+                    d3 = d3 + p3
+
+                    total_spectral_power = total_spectral_power + p1 + p2 + p3
+                    m = m + 1
+
+                let den: Float = d12 * d3
+                if den > 0.000000000001:
+                    let num_sq: Float = sum_re * sum_re + sum_im * sum_im
+                    var b2: Float = num_sq / den
+                    if b2 > 1.0: b2 = 1.0
+                    if b2 > max_b2:
+                        max_b2 = b2
+                    if b2 > 0.15:
+                        total_coupled_power = total_coupled_power + math_sqrt(num_sq)
+            k2 = k2 + 1
+        k1 = k1 + 1
+
+    decay spec_r
+    decay spec_i
+    decay spec_p
+
+    var dist_ratio: Float = 0.0
+    if total_spectral_power > 0.000001:
+        dist_ratio = 1.0 - (total_coupled_power / total_spectral_power)
+        if dist_ratio < 0.0: dist_ratio = 0.0
+        if dist_ratio > 1.0: dist_ratio = 1.0
 
     var v: String = "HARMONIC LOCK (Clean)"
-    if b_sq < 0.04 and dist_ratio > 0.4:
+    if max_b2 < 0.05 and dist_ratio > 0.35:
         v = "HIGH INTERMODULATION DISTORTION"
-    elif b_sq < 0.08:
+    elif max_b2 < 0.12:
         v = "WEAK PHASE COUPLING"
 
     return BispectrumVerdict {
         block_idx: block_idx,
-        bicoherence_sq: b_sq,
-        qpc_phase_coherence: math_sqrt(b_sq),
+        bicoherence_sq: max_b2,
+        qpc_phase_coherence: math_sqrt(max_b2),
         distortion_ratio: dist_ratio,
         verdict: v,
     }

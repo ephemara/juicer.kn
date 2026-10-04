@@ -53,30 +53,78 @@ is formally a **cascaded multi-channel IIR filter stage**. Some stages are all-p
 (flat gain, no phase rotation) or idling ($dH/dl \approx 0$ — they recirculate latent
 state without compressing entropy). Those are dead weight: cost without transformation.
 
-### What ships today (all live, all receipted)
+### What is REAL vs what is a PLACEHOLDER
 
-| Capability | Command | State |
+**Read this before quoting any number from this repo.** The mechanical layer is
+production-grade. The analytical layer is not written yet.
+
+| Layer | Command / module | State |
 |---|---|---|
-| **GGUF Direct DMA Parse** — header, KV directory, tensor descriptors, DiT block topology | `jc profile` | ✅ 10.56 GB / 1,303 tensors / 40 blocks scanned in ~40 ms |
-| **Physical Zero-Copy Slicer** — excise blocks, recompute offsets, re-index `blocks.*` contiguously, patch `block_count`, DMA-stream survivors | `jc slice` | ✅ emits a valid GGUF (ComfyUI / llama.cpp / Ollama / LM Studio) |
-| **LoRA Fuse Engine** — bake rank-K adapters into base weights (exact FP32/FP16 add for 1D biases/norms; Tensor-Core GEMM + inline dequant + fast GPU Q4_K quant for 2D quantized linears) | `jc fuse` | ✅ ~0.9 s per block; fuse **and** slice in one pass |
-| **Dynamic Step-Skip Scheduler** — emits a JSON step→block recipe for ComfyUI / vLLM / llama.cpp | `jc schedule` | ✅ |
-| **Formal Prove Battery** — 8 in-memory mathematical batteries, green in <1 s | `jc prove` | ✅ 8/8 PASS |
+| **GGUF v2/v3 DMA parser** — header, KV scan, tensor descriptors (name/dims/type/offset), per-block byte+tensor census across `blocks.<i>`, `double_blocks.<i>`, `single_blocks.<i>` | `gguf_parser.kn` | ✅ **REAL.** Reads the actual file over `kernel32`. 10.56 GB Wan 2.1 = 1,303 tensors / 40 blocks in ~40 ms |
+| **Physical slicer** — filter tensors, re-index `blocks.<i>` contiguously, recompute aligned offsets, patch tensor count, DMA-stream payloads | `slicer.kn` | ✅ **REAL.** Produced playable 16/20/24-block Wan GGUFs in ComfyUI |
+| **LoRA fuse engine** — FP32/FP16 exact add for 1D, CUDA dequant → Tensor-Core GEMM → Q4_K requant for 2D | `fuse.kn` + `scripts/fuse_engine.py` | ✅ **REAL.** Numerically verified (<1e-4 err vs exact); ~0.9 s/block on a Quadro RTX 3000 |
+| **Prove battery** — LE decoders, IEEE-754, `+32` slack, re-index invariant, LoRA key mapping | `prove.kn` | ✅ **REAL**, 8/8 — but it tests **primitives**, not the analysis |
+| **CLI / dispatch / scheduler JSON emit** | `dispatch.kn`, `scheduler.kn` | ✅ REAL plumbing |
+| **`jc profile` redundancy verdicts** | `dispatch.kn` | ⛔ **PLACEHOLDER — the numbers are fiction.** See below |
+| **Lenses 1–4 (`spectral_lens`, `entropy_lens`, `bispectrum_lens`, `frft_lens`)** | | ⛔ **NOT WIRED TO WEIGHTS.** Implemented and unit-proven, but no caller feeds them real data |
+| **Step-skip schedule** | `frft_lens.kn` | ⛔ **Hardcoded** 100% / 50% / 75% constant table. FrFT is not involved |
+
+#### The `jc profile` problem (do not quote its output as a result)
+
+`GgufBlock` carries only `block_idx`, `tensor_count`, `total_bytes` — **no weight bytes
+are ever loaded.** `run_profile_command` synthesizes a 64-element sample per block:
+
+```kn
+let base_w: Float = math_sin(fsi * 0.15 + fbi * 0.3)
+let decay_w: Float = 1.0 / (1.0 + (fbi - 18.0) * (fbi - 18.0) * 0.02)   // bell centred on block 18
+push(sample, base_w * decay_w)
+```
+
+The `EXCISE (Candidate)` column is therefore **the dispatcher's own parabola**, pushed
+through lenses that were handed noise. It is a demo of the output format, not a
+measurement. Likewise:
+
+- `spectral_power_iteration` returns an RMS × √dim — it is **not** power iteration on
+  $\Delta W_l = W_{out} \cdot W_{in}$, and $\Delta W$ is never formed.
+- Lens 3 (bispectrum) and Lens 4 (FrFT) are never called from the profile path.
+- `generate_step_schedule` ignores its arguments' meaning and emits a fixed pattern.
+
+**Do not use `jc profile`'s recommended `--drop` list on a model you care about.** Every
+successful slice so far was hand-specified (`--drop 10,...`) and validated by rendering.
+
+#### Known defect: KV metadata is copied verbatim
+
+The slicer patches the **tensor count** (u64 at header offset 8) and rewrites the whole
+tensor directory, but copies the **KV metadata section byte-for-byte**. So a stale
+`*.block_count` KV survives the slice. ComfyUI's GGUF loader derives blocks from tensor
+names, so Wan/Flux still boot — but **`llama.cpp` / Ollama / LM Studio will read the old
+layer count on LLaMA-family GGUFs.** The "Ready to load in ComfyUI, Ollama, LM Studio, or
+llama.cpp!" banner is currently an overclaim for LLMs. Fix: locate the `*.block_count`
+KV and rewrite its 4-byte value in the copied buffer before write-out.
+
+### The road ahead
+
+1. **Read real weights.** Extend `GgufParser` to return per-tensor payload offsets, then
+   stream a strided sample of each block's actual quantized bytes into the lenses. This
+   is the single change that turns `jc profile` from theater into an instrument.
+2. **Form the real object.** Lens 1 should ingest per-layer $W_{out}$/$W_{in}$ products
+   (or at minimum per-tensor weight statistics: kurtosis, per-channel variance, quant
+   scale distribution) instead of a synthesized sine.
+3. **Patch stale KVs** (see defect above).
+4. **Decide where to spend the analysis budget** — see §5's note on which lens is worth
+   the compute.
 
 Progressive carving: a 40-block Wan 2.1 → 24 → 20 → 18 → 16 blocks, each losing
 ~247 MB; the practical target is **≤ 20 blocks ≈ 5 GB so the whole thing sits in 6 GB
 VRAM and PCIe offload drops to zero** (the 10–28× speed multiplier is the *bus* jump
 from ~10 GB/s PCIe to ~288 GB/s GDDR6, not the FLOPs).
 
-### The two calibration layers still maturing
+### Why the VRAM line matters (and what it does *not* buy you)
 
-1. **Live weight dequantization in the lenses.** Today the lenses read block descriptors,
-   tensor topology, and quantization headers to synthesize per-block transfer curves. Adding
-   an inline Q4_K/Q8_0 dequantizer kernel lets Lens 1/2 crunch the *exact* unscaled weights
-   for pinpoint singular values.
-2. **Downstream metadata sensitivity.** After dropping blocks, `block_count`-style metadata
-   must be patched correctly (LLaMA uses `llama.block_count`; the ComfyUI GGUF loader
-   enumerates `blocks.*`). Verify a sliced model actually boots before shipping a profile.
+The 10–28× figure is a **bus** comparison (~10 GB/s PCIe vs ~288 GB/s GDDR6), not a
+wall-clock prediction. At 480p / 81 frames the Wan sequence is ~32.8k tokens, so
+**attention is quadratic and dominates the FLOP budget** — depth pruning touches the
+linear part, which is the smaller term. See §11 for the honest wall-clock ceiling.
 
 ---
 
@@ -246,16 +294,28 @@ edit, reformat, or add to it. If the baseline needs updating, update both copies
 
 ---
 
-## 5. The 4 DSP Lenses (what `juicer` actually computes)
+## 5. The 4 DSP Lenses (what `juicer` is *designed* to compute)
 
-| # | Module | Signal-theoretic object | Verdict it mints |
-|---|---|---|---|
-| 1 | `spectral_lens.kn` | Transfer function $H(\omega)$ — power iteration on $\Delta W_l = W_{out} \cdot W_{in}$ → spectral radius $\rho$, condition number $\kappa$, dB gain | `is_all_pass` → **EXCISE** |
-| 2 | `entropy_lens.kn` | 3D Lehmer ordinal permutation entropy $H_{PE}$, velocity $v_H = dH/dl$, Kaspar–Schuster LZ76 complexity | `is_idling` → **EXCISE** |
-| 3 | `bispectrum_lens.kn` | Higher-order spectral analysis: normalized bicoherence $b^2$ → quadratic phase coupling vs. intermodulation | harmonic binding vs. artifact source |
-| 4 | `frft_lens.kn` | Fractional Fourier transform chirp matched filtering over diffusion flow trajectories | step→block skip schedule |
+> ⚠️ **These are the intended semantics. As of today no lens is fed real weights** — see
+> §1, "What is REAL vs what is a PLACEHOLDER." The table below describes the design and
+> the unit-proven kernels, not the current `jc profile` output.
 
-Verdicts are printed as a table with the **exact `--drop` list** and reclaimed bytes.
+| # | Module | Signal-theoretic object | Verdict it mints | Worth the compute? |
+|---|---|---|---|---|
+| 1 | `spectral_lens.kn` | Transfer function $H(\omega)$ — power iteration on $\Delta W_l = W_{out} \cdot W_{in}$ → spectral radius $\rho$, condition number $\kappa$, dB gain | `is_all_pass` → **EXCISE** | **Yes, but the naive form is wrong.** see note |
+| 2 | `entropy_lens.kn` | 3D Lehmer ordinal permutation entropy $H_{PE}$, velocity $v_H = dH/dl$, Kaspar–Schuster LZ76 complexity | `is_idling` → **EXCISE** | Unproven |
+| 3 | `bispectrum_lens.kn` | Higher-order spectral analysis: normalized bicoherence $b^2$ → quadratic phase coupling vs. intermodulation | harmonic binding vs. artifact source | Diagnostic only — not a pruning signal |
+| 4 | `frft_lens.kn` | FrFT chirp matched filtering over diffusion flow trajectories | step→block skip schedule | Unproven; schedule is currently constant |
+
+**Note on Lens 1.** $\Delta W_l = W_{out} W_{in}$ is the *linearised* block Jacobian. A
+small $\|\Delta W\|$ does **not** imply the block is removable — the block also carries
+residual identity path, LayerNorm gains, and adaLN/timestep modulation (`modulation`
+biases are what make a DiT block do anything at a given $t$). Measuring
+$\rho(\Delta W)$ alone will happily recommend excising blocks that are load-bearing.
+Any real implementation must also read the norm gains and modulation weights, and must
+be validated by *rendering*, not by the metric.
+
+Verdicts are printed as a table with the exact `--drop` list and reclaimed bytes.
 `jc profile` never writes a model; `jc slice` never decides what to drop.
 
 ---
@@ -375,13 +435,15 @@ CUDA-enabled Python with `torch` + `gguf` (the ComfyUI embedded interpreter). So
    binary under 1.5 MB with `kernel32` as its only import family.
 8. **Never write a sliced model without re-indexing it.**
    Dropping `blocks.18` and leaving `blocks.19..39` in place produces a model that opens
-   and then fails. Contiguous renumbering to `blocks.0..blocks.N-1` plus the
-   `*_block_count` metadata patch is part of the slice, not a follow-up.
-9. **Prove before shipping a profile.** "It looks redundant" is not a status. A status is
-   "Lens 1 all-pass at −19.7 dB, Lens 2 velocity 0.00, 4 blocks excised, 8.58 GB → 8.58 GB
-   output opens in ComfyUI, `jc prove` 8/8 green."
+   and then fails. Contiguous renumbering to `blocks.0..blocks.N-1` is part of the slice,
+   not a follow-up. (Patch tensor count ✅ done. Patching stale `*.block_count` in the KV
+   section ❌ **not done** — see §1 defect note.)
+9. **A metric is not a validation.** No block gets dropped on a lens score alone. The
+   only proof a slice worked is a rendered clip that looks like the source. Lens output
+   nominates; rendering decides.
 10. **Receipts for everything.** Benchmark numbers come from a run, not an estimate.
-    Estimate tables are labeled as estimates.
+    Estimate tables are labeled as estimates. Never quote `jc profile`'s verdict column
+    as a finding — it is synthetic (§1).
 11. **Check `memory.tsv` before work; log with `scripts/memlog.exe` after.**
     Never touch code without reading recent history. Never finish a turn without logging
     your file modifications. No silent edits.
@@ -515,14 +577,64 @@ Update the row whenever a module is built, proven, or changes status.
 
 ## 11. Status
 
-Working: 4 DSP lenses, GGUF v2/v3 parser, physical zero-copy slicer, LoRA fuse engine,
-dynamic step-skip scheduler, 8/8 prove battery, `jc` CLI + multi-call shim, automated
-build. Verified live against local Wan 2.1 14B Q4_K_M (40 blocks, 10.56 GB) and Flux 2
-Klein 9B, with end-to-end ComfyUI I2V benchmarks driven by `scripts/benchmark_wan.py`.
+**Working and verified (the mechanical layer):** GGUF v2/v3 DMA parser, physical zero-copy
+slicer, LoRA fuse engine, `jc` CLI + shim, 8/8 prove battery, automated build, ledgers.
+Sliced 16/20/24-block Wan 2.1 GGUFs have rendered through ComfyUI end-to-end.
 
-Next: (a) inline Q4_K/Q8_0 dequantizer so the lenses read exact weights; (b) confirm
-sliced-model load in the ComfyUI GGUF loader and patch whatever metadata key it needs;
-(c) drive the carve ladder 40 → 24 → 20 → 18 → 16 blocks to land the model fully
-resident in 6 GB VRAM.
+**Not working (the analytical layer):** `jc profile`'s redundancy verdicts are synthetic
+(§1). The four lenses, the bispectrum path, and the FrFT schedule generator are unit-proven
+code with **no real caller**. There is currently **no evidence** that any specific Wan
+block is removable.
 
-The thesis is simple: **squeeze the bloat out of models. Pure juice, zero flab.**
+### The honest ceiling on this box (Quadro RTX 3000 Mobile, 6 GB)
+
+Order-of-magnitude arithmetic, assumptions stated so you can falsify them. Wan 2.1 14B @
+480p / 81 frames, latent from VAE 8× spatial + 21 temporal frames = **~32.8k tokens**.
+DiT attention is **quadratic in tokens**; the FFN is linear.
+
+| Term | Per step | ×4 steps | Notes |
+|---|---|---|---|
+| Attention QKᵀ+AV | ~22 TFLOP/layer × 40 = ~880 TFLOP | ~3.5 PFLOP | **dominant** |
+| MoE/FFN | ~0.9 TFLOP | ~3.7 TFLOP | negligible by comparison |
+| Weight traffic if resident | 5 GB @ 288 GB/s ≈ 17 ms | ~70 ms | not the bottleneck once resident |
+| Turing FP16 tensor throughput | ~25–30 TFLOPS | — | TU106, 240 tensor cores |
+
+→ **≈ 120 s of pure compute for a 4-step clip, if the model is 100% VRAM-resident and
+there is zero PCIe traffic.** Your measured 300–540 s baseline is consistent with that
+plus offload stalls.
+
+So the realistic ladder for **this specific model on this specific card** is:
+
+| Change | Multiplier | Verified? |
+|---|---|---|
+| Today (PCIe offload, 4-step Lightning) | 1× (300–540 s) | yes, measured |
+| Get fully resident + fused LoRA | ~2–4× → **~120–180 s** | residency yes; timing **not yet measured** |
+| Structural pruning (15–25% depth) | ~1.1–1.3× on the attention-bound part | no |
+| Step-skip schedule | ≤1.25× at 4 steps | no |
+| Fewer frames / lower res | **quadratic** — 81→41 frames ≈ 4× | yes, trivially true |
+
+**Neither depth pruning nor step skipping attacks the dominant term.** The levers that do
+are (a) frame count / resolution, and (b) a smaller model. The previous "~22 s for a 14B
+clip" figure was derived from the PCIe→GDDR bandwidth ratio and ignored attention's
+quadratic cost. It is not achievable on this card with this model.
+
+### Where the real wins are, ranked
+
+1. **Requantize instead of prune.** 14B Q4_K_M = 10.56 GB; **14B Q3_K_M ≈ 5.4 GB**, IQ2 ≈
+   4 GB. Diffusion models tolerate aggressive quantisation far better than LLMs, and
+   requantisation is *exactly the dequant→requant machinery `fuse_engine.py` already has*.
+   This crosses the 6 GB line **without touching network depth**, so quality loss is
+   smooth and tunable rather than a cliff. **Highest ROI by a wide margin.**
+2. **Implement real weight-level importance scoring** (per-tensor kurtosis / per-channel
+   variance / activation-free Wanda-style scores). This is what makes pruning principled
+   instead of a coin flip.
+3. **Frame/resolution policy** — the only lever that hits the quadratic term, and it costs
+the user nothing but `jc schedule --frames`.
+4. **Structure the model for the card.** A 6 GB Turing part is the wrong vehicle for a 14B
+   video model. Wan 2.2 TI2V-5B / Wan 2.1 1.3B fit natively and run a 5 s clip in tens of
+   seconds. `juicer`'s job is to make the *best model that fits* as good as possible — not
+   to pretend a 14B fits.
+
+The thesis holds and is unfalsified: **squeeze the bloat out of models. Pure juice, zero
+flab.** But bloat is measured, never asserted — and today the measuring instrument is the
+part that is not built yet.
