@@ -3,7 +3,7 @@
 /models/
 /models
 models/
-/.kain/
+.kain/
 *.exe
 *.obj
 *.ll
@@ -15,3 +15,10 @@ juicer.kn.amalgamated
 juicer.exe
 jc.exe
 *.gguf
+
+# Benchmark / diagnostic artifacts (put anything worth keeping under reports/)
+comfy_server.log
+*.log
+*_frame_*.png
+frame_*.png
+example_inspect.png

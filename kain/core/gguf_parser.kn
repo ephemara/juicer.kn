@@ -36,6 +36,7 @@ pub struct GgufModel:
     block_count: Int
     alignment: Int
     tensor_data_offset: Int
+    kv_data_offset: Int
     tensors: Array<GgufTensor>
     blocks: Array<GgufBlock>
 
@@ -79,6 +80,7 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
         block_count: 0,
         alignment: 32,
         tensor_data_offset: 0,
+        kv_data_offset: 0,
         tensors: empty_tensors,
         blocks: empty_blocks,
     }
@@ -220,6 +222,8 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
                     ai = ai + 1
         kv_i = kv_i + 1
 
+    let kv_end_offset: Int = cur_off
+
     // Parse Tensor Descriptors
     var tensor_list: Array<GgufTensor> = []
     var max_block_id: Int = -1
@@ -303,7 +307,10 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
     if rem != 0:
         data_offset = data_offset + (detected_alignment - rem)
 
-    // Compute tensor sizes from consecutive offsets
+    // Compute tensor sizes and accumulate block statistics in a single O(N) pass
+    let blk_counts: ptr<Int> = alloc_zeroed(2048, "Int")
+    let blk_bytes: ptr<Int> = alloc_zeroed(2048, "Int")
+
     var si: Int = 0
     while si < len(tensor_list):
         var tsz: Int = 0
@@ -312,34 +319,37 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
         else:
             tsz = fsz - (data_offset + tensor_list[si].offset)
         tensor_list[si].size_bytes = tsz
+
+        let b: Int = tensor_list[si].block_idx
+        if b >= 0 and b < 2048:
+            let cur_c: Int = mem_load(ptr_offset(blk_counts, b, "Int"), "Int")
+            let cur_b: Int = mem_load(ptr_offset(blk_bytes, b, "Int"), "Int")
+            mem_store(ptr_offset(blk_counts, b, "Int"), cur_c + 1, "Int")
+            mem_store(ptr_offset(blk_bytes, b, "Int"), cur_b + tsz, "Int")
         si = si + 1
 
     decay io_buf
     decay nslot
     let _close_rc: Int = k_CloseHandle(h)
 
-    // Group tensors into block summary
+    // Build block summary in a single O(B) sweep
     var block_list: Array<GgufBlock> = []
     let num_blocks: Int = max_block_id + 1
-    if num_blocks > 0:
-        var bi: Int = 0
-        while bi < num_blocks:
-            var b_t_count: Int = 0
-            var b_total_bytes: Int = 0
-            var tj: Int = 0
-            while tj < len(tensor_list):
-                if tensor_list[tj].block_idx == bi:
-                    b_t_count = b_t_count + 1
-                    b_total_bytes = b_total_bytes + tensor_list[tj].size_bytes
-                tj = tj + 1
-            if b_t_count > 0:
-                let blk = GgufBlock {
-                    block_idx: bi,
-                    tensor_count: b_t_count,
-                    total_bytes: b_total_bytes,
-                }
-                push(block_list, blk)
-            bi = bi + 1
+    var bi: Int = 0
+    while bi < num_blocks:
+        let cnt: Int = mem_load(ptr_offset(blk_counts, bi, "Int"), "Int")
+        let bsz: Int = mem_load(ptr_offset(blk_bytes, bi, "Int"), "Int")
+        if cnt > 0:
+            let blk = GgufBlock {
+                block_idx: bi,
+                tensor_count: cnt,
+                total_bytes: bsz,
+            }
+            push(block_list, blk)
+        bi = bi + 1
+
+    decay blk_counts
+    decay blk_bytes
 
     return GgufModel {
         path: path,
@@ -351,6 +361,7 @@ pub fn parse_gguf_model(path: String) -> GgufModel with Unsafe:
         block_count: len(block_list),
         alignment: detected_alignment,
         tensor_data_offset: data_offset,
+        kv_data_offset: kv_end_offset,
         tensors: tensor_list,
         blocks: block_list,
     }

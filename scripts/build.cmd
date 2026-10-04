@@ -1,16 +1,18 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set KAIN_BIN="T:\KainProjects\Kain\.kain\bin\kain.exe"
-if not exist %KAIN_BIN% (
+cd /d "%~dp0.."
+
+rem The Kain compiler monorepo is always a sibling folder named "kain\"
+rem (the project root above us). Never hardcode a drive letter.
+set KAIN_BIN=..\kain\.kain\bin\kain.exe
+if not exist "%KAIN_BIN%" (
     set KAIN_BIN=kain
 )
 
 echo ================================================================================
 echo  juicer.kn — Build Pipeline
 echo ================================================================================
-
-cd /d "%~dp0.."
 
 echo [1/3] Amalgamating kain/core/*.kn -^> kain/juicer.kn ...
 %KAIN_BIN% amalgamate --raw kain/core -o kain/juicer.kn

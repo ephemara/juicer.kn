@@ -12,9 +12,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 def find_kain():
-    custom = Path(r"T:\KainProjects\Kain\.kain\bin\kain.exe")
-    if custom.exists():
-        return str(custom)
+    # The Kain compiler monorepo is always a sibling folder named "kain/"
+    # (i.e. the project root above us). Never hardcode a drive letter.
+    local = ROOT.parent / "kain" / ".kain" / "bin" / "kain.exe"
+    if local.exists():
+        return str(local)
     which = shutil.which("kain")
     if which:
         return which

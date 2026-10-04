@@ -21,8 +21,8 @@ pub fn k_CreateFileA(name: String, access: Int, sharemode: Int, sec: ptr<Void>, 
 @extern @link_name("GetFileSizeEx")
 pub fn k_GetFileSizeEx(h: ptr<Void>, outsz: ptr<Int>) -> Int
 
-@extern @link_name("SetFilePointer")
-pub fn k_SetFilePointer(h: ptr<Void>, lo: Int, hi: ptr<Int>, method: Int) -> Int
+@extern @link_name("SetFilePointerEx")
+pub fn k_SetFilePointerEx(h: ptr<Void>, dist: Int, new_pos: ptr<Void>, method: Int) -> Int
 
 @extern @link_name("ReadFile")
 pub fn k_ReadFile(h: ptr<Void>, buf: ptr<Byte>, n: Int, outn: ptr<Int>, ov: ptr<Void>) -> Int
@@ -86,13 +86,7 @@ pub fn k_size(h: ptr<Void>) -> Int with Unsafe:
     return sz
 
 pub fn k_seek(h: ptr<Void>, off: Int) -> Int with Unsafe:
-    let hislot: ptr<Int> = alloc_zeroed(1, "Int")
-    let hi_part: Int = off / 4294967296
-    mem_store(hislot, hi_part, "Int")
-    let lo: Int = off % 4294967296
-    let r: Int = k_SetFilePointer(h, lo, hislot, 0)
-    decay hislot
-    return r
+    return k_SetFilePointerEx(h, off, null_ptr(), 0)
 
 pub fn k_read_at(h: ptr<Void>, nslot: ptr<Int>, off: Int, buf: ptr<Byte>, n: Int) -> Int with Unsafe:
     let _s: Int = k_seek(h, off)
@@ -125,17 +119,17 @@ pub fn read_u32_le(buf: ptr<Byte>, off: Int) -> Int with Unsafe:
 pub fn read_u64_le(buf: ptr<Byte>, off: Int) -> Int with Unsafe:
     let lo: Int = read_u32_le(buf, off)
     let hi: Int = read_u32_le(buf, off + 4)
-    return lo + hi * 4294967296
+    return lo + (hi << 32)
 
 pub fn write_u32_le(buf: ptr<Byte>, off: Int, val: Int) with Unsafe:
     bstore(buf, off, val & 255)
-    bstore(buf, off + 1, (val / 256) & 255)
-    bstore(buf, off + 2, (val / 65536) & 255)
-    bstore(buf, off + 3, (val / 16777216) & 255)
+    bstore(buf, off + 1, (val >> 8) & 255)
+    bstore(buf, off + 2, (val >> 16) & 255)
+    bstore(buf, off + 3, (val >> 24) & 255)
 
 pub fn write_u64_le(buf: ptr<Byte>, off: Int, val: Int) with Unsafe:
-    let lo: Int = val % 4294967296
-    let hi: Int = val / 4294967296
+    let lo: Int = val & 4294967295
+    let hi: Int = (val >> 32) & 4294967295
     write_u32_le(buf, off, lo)
     write_u32_le(buf, off + 4, hi)
 

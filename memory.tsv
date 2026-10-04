@@ -1,0 +1,11 @@
+date	area	type	description	file
+2026-10-04	repo	add	AGENTS.md onboarding + operating rules; compiler referenced as ../kain (no drive letters); docs/kain flagged as the shared vendored baseline	AGENTS.md
+2026-10-04	build	fix	build.py/build.cmd resolve compiler at ../kain/.kain/bin/kain.exe then PATH fallback; removed hardcoded T:\ path	scripts/build.py,scripts/build.cmd
+2026-10-04	prove	update	prove battery labels corrected to 8/8; all 8 batteries green after rebuild	kain/core/prove.kn
+2026-10-04	fuse	update	JUICER_PY / JUICER_COMFY_PY env overrides for the CUDA interpreter; machine-local default only	kain/core/fuse.kn
+2026-10-04	scripts	update	ComfyUI paths made env-overridable (COMFYUI_HOME/APP/OUTPUT, JUICER_COMFY_GGUF/LOG)	scripts/fuse_engine.py,scripts/start_comfy.py,scripts/benchmark_wan.py
+2026-10-04	scripts	add	memlog.kn header rebranded for juicer.kn; memlog.exe built	scripts/memlog.kn
+2026-10-04	repo	add	catalog.tsv instantiated with 13 module/artifact rows; 8/8 prove green	catalog.tsv
+2026-10-04	repo	update	gitignore: benchmark/log artifacts excluded	.gitignore
+2026-10-04	docs	add	AGENTS.md finalized: ledgers section + layout + rules cross-checked	AGENTS.md
+2026-10-04	build	fix	gitignore: .kain/ nested intermediates + frame_*.png log artifacts	.gitignore

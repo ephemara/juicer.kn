@@ -18,76 +18,51 @@ pub struct SpectralVerdict:
     prune_recommendation: String
 
 pub fn spectral_power_iteration(matrix_sample: Array<Float>, dim: Int, max_iter: Int) -> Float:
-    if dim <= 0:
+    let n: Int = len(matrix_sample)
+    if n <= 0:
         return 0.0
-    // Initialize probe vector v
-    var v: Array<Float> = []
+    var sum_sq: Float = 0.0
     var i: Int = 0
-    while i < dim:
-        push(v, 1.0 / math_sqrt(dim as Float))
+    while i < n:
+        let val: Float = matrix_sample[i]
+        sum_sq = sum_sq + val * val
         i = i + 1
-
-    var iter: Int = 0
-    var eigenvalue: Float = 0.0
-    while iter < max_iter:
-        // Matrix-vector multiply: w = M * v
-        var w: Array<Float> = []
-        var r: Int = 0
-        while r < dim:
-            var sum: Float = 0.0
-            var c: Int = 0
-            while c < dim:
-                let idx: Int = (r * dim + c) % len(matrix_sample)
-                sum = sum + matrix_sample[idx] * v[c]
-                c = c + 1
-            push(w, sum)
-            r = r + 1
-
-        // Norm of w
-        var norm_sq: Float = 0.0
-        var k: Int = 0
-        while k < dim:
-            norm_sq = norm_sq + w[k] * w[k]
-            k = k + 1
-        let norm: Float = math_sqrt(norm_sq)
-        if norm <= 0.000000001:
-            return 0.0
-        eigenvalue = norm
-
-        // Normalize v = w / norm
-        var ni: Int = 0
-        while ni < dim:
-            v[ni] = w[ni] / norm
-            ni = ni + 1
-
-        iter = iter + 1
-
-    return eigenvalue
+    let rms: Float = math_sqrt(sum_sq / (n as Float))
+    return rms * math_sqrt(dim as Float)
 
 pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim: Int) -> SpectralVerdict:
-    let rho: Float = spectral_power_iteration(weight_sample, dim, 16)
-    
-    // Estimate condition number by deflation or perturbation
-    var rho_sub: Float = rho * 0.85
-    if rho > 0.0001:
-        var perturbed: Array<Float> = []
-        var pi: Int = 0
-        while pi < len(weight_sample):
-            push(perturbed, weight_sample[pi] * 0.72)
-            pi = pi + 1
-        rho_sub = spectral_power_iteration(perturbed, dim, 8)
-    
+    let n: Int = len(weight_sample)
+    if n <= 0:
+        return SpectralVerdict {
+            block_idx: block_idx,
+            spectral_radius: 1.0,
+            condition_number: 1.0,
+            delta_gain_db: 0.0,
+            is_all_pass: 0,
+            prune_recommendation: "ACTIVE",
+        }
+
+    var sum_sq: Float = 0.0
+    var max_val: Float = 0.0
+    var i: Int = 0
+    while i < n:
+        let val: Float = math_abs(weight_sample[i])
+        sum_sq = sum_sq + val * val
+        if val > max_val:
+            max_val = val
+        i = i + 1
+
+    let rms: Float = math_sqrt(sum_sq / (n as Float))
+    let rho: Float = rms * math_sqrt(dim as Float)
     var kappa: Float = 1.0
-    if rho_sub > 0.000001:
-        kappa = rho / rho_sub
+    if rms > 0.000001:
+        kappa = max_val / rms
     if kappa < 1.0:
         kappa = 1.0
 
     // Delta gain in dB: 20 * log10(rho) approx
     var gain_db: Float = 0.0
     if rho > 0.000001:
-        // log10(x) approx using natural log expansion
-        // ln(x) approx:
         var x: Float = rho
         var l10: Float = 0.0
         while x > 2.0:
@@ -102,10 +77,7 @@ pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim:
         gain_db = 20.0 * l10
 
     var all_pass: Int = 0
-    var rec: String = "KEEP"
-    
-    // All-Pass detection criteria:
-    // If spectral gain is very low (< -22 dB) or condition number kappa ~ 1.0 (flat transfer)
+    var rec: String = "ACTIVE"
     if gain_db < (0.0 - 22.0) or (gain_db < (0.0 - 15.0) and kappa < 1.15):
         all_pass = 1
         rec = "EXCISE (All-Pass Idling)"

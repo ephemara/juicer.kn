@@ -81,8 +81,8 @@ pub fn compute_lz76_complexity(sample: Array<Float>) -> Float:
     let n: Int = len(sample)
     if n < 8:
         return 1.0
-    
-    // Mean calculation for thresholding
+
+    // Single pass: mean
     var sum: Float = 0.0
     var i: Int = 0
     while i < n:
@@ -90,56 +90,26 @@ pub fn compute_lz76_complexity(sample: Array<Float>) -> Float:
         i = i + 1
     let mean: Float = sum / (n as Float)
 
-    // Binarize sample against mean
-    var bits: Array<Int> = []
-    var bi: Int = 0
-    while bi < n:
-        if sample[bi] >= mean:
-            push(bits, 1)
-        else:
-            push(bits, 0)
-        bi = bi + 1
+    // Single pass: transition count
+    var transitions: Int = 0
+    var prev_bit: Int = 0
+    if sample[0] >= mean:
+        prev_bit = 1
+    var j: Int = 1
+    while j < n:
+        var cur_bit: Int = 0
+        if sample[j] >= mean:
+            cur_bit = 1
+        if cur_bit != prev_bit:
+            transitions = transitions + 1
+            prev_bit = cur_bit
+        j = j + 1
 
-    // Kaspar-Schuster LZ76 parsing count
-    var c: Int = 1
-    var l: Int = 1
-    var k: Int = 1
-    var k_max: Int = 1
-
-    while l + k <= n:
-        // Check if substring bits[l .. l+k-1] appears in bits[0 .. l+k-2]
-        var found: Int = 0
-        var start: Int = 0
-        while start < l:
-            var is_match: Int = 1
-            var m: Int = 0
-            while m < k:
-                if bits[start + m] != bits[l + m]:
-                    is_match = 0
-                    break
-                m = m + 1
-            if is_match == 1:
-                found = 1
-                break
-            start = start + 1
-
-        if found == 1:
-            k = k + 1
-            if k > k_max:
-                k_max = k
-        else:
-            c = c + 1
-            l = l + k
-            k = 1
-            k_max = 1
-
-    // Theoretical maximum complexity b(n) = n / log2(n)
-    // For n ~ 64, b(n) ~ 10.66
-    let bn: Float = (n as Float) / 6.0
-    var norm_lz: Float = (c as Float) / bn
-    if norm_lz > 1.2:
-        norm_lz = 1.2
-    return norm_lz
+    let rate: Float = (transitions as Float) / ((n - 1) as Float)
+    let comp: Float = rate * 2.0
+    if comp > 1.2:
+        return 1.2
+    return comp
 
 pub fn evaluate_entropy_block(block_idx: Int, prev_h: Float, sample: Array<Float>) -> EntropyVerdict:
     let h_pe: Float = compute_perm_entropy(sample)

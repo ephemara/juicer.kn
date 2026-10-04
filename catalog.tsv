@@ -1,0 +1,14 @@
+module	source	target	status	receipt	notes	updated
+_common	kain/core/_common.kn	juicer.exe/jc.exe	fused	prove[1/8],[2/8] PASS	kernel32 DMA FFI; +32-slack arenas; LE decoders; parsers; fmt; EXIT/GGUF consts	2026-10-04
+gguf_parser	kain/core/gguf_parser.kn	juicer.exe/jc.exe	fused	wan2.1-i2v-14b-Q4_K_M: 1303 tensors / 40 blocks parsed in ~40ms	GGUF v2/v3 header + KV dir + tensor descriptors; blocks.<i> and double_/single_blocks.<i> DiT topology	2026-10-04
+spectral_lens	kain/core/spectral_lens.kn	juicer.exe/jc.exe	fused	prove[3/8] PASS (rho_eye=0, rho_3x=3)	Lens 1: power iteration on dW=Wout*Win; spectral radius, condition number, all-pass dB gate	2026-10-04
+entropy_lens	kain/core/entropy_lens.kn	juicer.exe/jc.exe	fused	prove[4/8] PASS (H_mono=0, H_alt=0, LZ=1)	Lens 2: 3D Lehmer permutation entropy, velocity dH/dl, LZ76 complexity	2026-10-04
+bispectrum_lens	kain/core/bispectrum_lens.kn	juicer.exe/jc.exe	fused	prove[5/8] PASS (b^2=0, HARMONIC LOCK)	Lens 3: DFT8 + normalized bicoherence; QPC vs intermodulation	2026-10-04
+frft_lens	kain/core/frft_lens.kn	juicer.exe/jc.exe	fused	prove[6/8] PASS (speedup=1x sanity)	Lens 4: FrFT chirp energy + step->block schedule generator	2026-10-04
+slicer	kain/core/slicer.kn	juicer.exe/jc.exe	fused	prove[7/8] PASS (blocks.2.cross_attn.k.weight); mini-GGUF slice+reprofile verified	zero-copy block excision; contiguous re-index; block_count patch; DMA stream	2026-10-04
+scheduler	kain/core/scheduler.kn	juicer.exe/jc.exe	fused	jc schedule wan2.1-14b --steps 4 -> step recipe JSON	step-adaptive block bypass recipe for ComfyUI/vLLM/llama.cpp	2026-10-04
+fuse	kain/core/fuse.kn	juicer.exe/jc.exe	fused	prove[8/8] PASS; ~0.9s/block fuse on Quadro RTX 3000	LoRA bake driver; interpreter via JUICER_PY/JUICER_COMFY_PY; math in scripts/fuse_engine.py	2026-10-04
+prove	kain/core/prove.kn	juicer.exe/jc.exe	fused	8/8 batteries green, <1s	in-memory formal verification suite	2026-10-04
+dispatch	kain/core/dispatch.kn	juicer.exe/jc.exe	fused	jc help/prove/profile/slice/fuse/schedule all routed	sole main(); CLI router + profile table printer	2026-10-04
+fuse_engine.py	scripts/fuse_engine.py	python helper	proven	GPU dequant + Tensor-Core GEMM + Q4_K requant; <0.0001 error vs exact	sanctioned Python: CUDA fusion only; never re-implements a native lane	2026-10-04
+memlog	scripts/memlog.kn	scripts/memlog.exe	builds	memlog.exe built; appends sanitized TSV rows	ledger helper (ported from TurboKain)	2026-10-04

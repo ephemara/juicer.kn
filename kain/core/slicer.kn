@@ -45,9 +45,46 @@ pub fn reindex_tensor_name(orig_name: String, drop_list: Array<Int>) -> String:
         if dot2 > 14:
             let num_str: String = text_substring_string(orig_name, 14, dot2 - 14)
             let old_id: Int = parse_int_text(num_str)
-            let new_id: Int = compute_new_block_index(old_id, drop_list)
+            var drops_before: Int = 0
+            var di: Int = 0
+            while di < len(drop_list):
+                if drop_list[di] < 1000 and drop_list[di] < old_id:
+                    drops_before = drops_before + 1
+                di = di + 1
+            let new_id: Int = old_id - drops_before
             let rest: String = text_substring_string(orig_name, dot2, len(orig_name) - dot2)
             return "double_blocks." + str(new_id) + rest
+    elif str_starts_with(orig_name, "single_blocks.") == 1:
+        let dot2: Int = find_from(orig_name, ".", 14)
+        if dot2 > 14:
+            let num_str: String = text_substring_string(orig_name, 14, dot2 - 14)
+            let old_id: Int = parse_int_text(num_str)
+            let old_full: Int = old_id + 1000
+            var drops_before: Int = 0
+            var di: Int = 0
+            while di < len(drop_list):
+                if drop_list[di] >= 1000 and drop_list[di] < old_full:
+                    drops_before = drops_before + 1
+                di = di + 1
+            let new_id: Int = old_id - drops_before
+            let rest: String = text_substring_string(orig_name, dot2, len(orig_name) - dot2)
+            return "single_blocks." + str(new_id) + rest
+    elif str_starts_with(orig_name, "blk.") == 1:
+        let dot2: Int = find_from(orig_name, ".", 4)
+        if dot2 > 4:
+            let num_str: String = text_substring_string(orig_name, 4, dot2 - 4)
+            let old_id: Int = parse_int_text(num_str)
+            let new_id: Int = compute_new_block_index(old_id, drop_list)
+            let rest: String = text_substring_string(orig_name, dot2, len(orig_name) - dot2)
+            return "blk." + str(new_id) + rest
+    elif str_starts_with(orig_name, "layers.") == 1:
+        let dot2: Int = find_from(orig_name, ".", 7)
+        if dot2 > 7:
+            let num_str: String = text_substring_string(orig_name, 7, dot2 - 7)
+            let old_id: Int = parse_int_text(num_str)
+            let new_id: Int = compute_new_block_index(old_id, drop_list)
+            let rest: String = text_substring_string(orig_name, dot2, len(orig_name) - dot2)
+            return "layers." + str(new_id) + rest
     return orig_name
 
 pub fn execute_gguf_slice(model: GgufModel, drop_list: Array<Int>, out_path: String) -> Int with Unsafe:
@@ -107,58 +144,15 @@ pub fn execute_gguf_slice(model: GgufModel, drop_list: Array<Int>, out_path: Str
 
     let nslot: ptr<Int> = alloc_zeroed(1, "Int")
 
-    // Read original KV metadata block
-    // We copy metadata verbatim up to tensor descriptors
-    let kv_block_size: Int = 1048576 // 1MB buffer for KV pairs
-    let kv_buf: ptr<Byte> = alloc_zeroed(kv_block_size + 32, "Byte")
-    let r_kv: Int = k_read_at(h_src, nslot, 0, kv_buf, kv_block_size)
+    // Read original GGUF header + KV metadata block directly (exact bytes)
+    let kv_total_len: Int = model.kv_data_offset
+    let kv_buf: ptr<Byte> = alloc_zeroed(kv_total_len + 32, "Byte")
+    let r_kv: Int = k_read_at(h_src, nslot, 0, kv_buf, kv_total_len)
+    // Update tensor count in header (offset 8 in GGUF header) - single 64-bit store (bytes 8..15)
+    let st_cnt: Int = len(surviving_tensors)
+    mem_store(ptr_offset(kv_buf, 8, "Byte"), st_cnt, "Int")
 
-    // Update tensor count in header (offset 8 in GGUF header)
-    write_u64_le(kv_buf, 8, len(surviving_tensors))
-
-    // Write GGUF header + KVs
-    // Compute size of header + KVs by re-parsing KV end offset
-    // In GGUF, tensor count is at offset 8, kv count is at offset 16
-    let kv_count: Int = read_u64_le(kv_buf, 16)
-    var cur_off: Int = 24
-    var kvi: Int = 0
-    while kvi < kv_count:
-        let klen: Int = read_u64_le(kv_buf, cur_off)
-        cur_off = cur_off + 8 + klen
-        let vtype: Int = read_u32_le(kv_buf, cur_off)
-        cur_off = cur_off + 4
-        if vtype == 0 or vtype == 1 or vtype == 7:
-            cur_off = cur_off + 1
-        elif vtype == 2 or vtype == 3:
-            cur_off = cur_off + 2
-        elif vtype == 4 or vtype == 5 or vtype == 6:
-            cur_off = cur_off + 4
-        elif vtype == 8:
-            let slen: Int = read_u64_le(kv_buf, cur_off)
-            cur_off = cur_off + 8 + slen
-        elif vtype == 10 or vtype == 11 or vtype == 12:
-            cur_off = cur_off + 8
-        elif vtype == 9:
-            let itype: Int = read_u32_le(kv_buf, cur_off)
-            let acnt: Int = read_u64_le(kv_buf, cur_off + 4)
-            cur_off = cur_off + 12
-            if itype == 0 or itype == 1 or itype == 7:
-                cur_off = cur_off + acnt
-            elif itype == 2 or itype == 3:
-                cur_off = cur_off + acnt * 2
-            elif itype == 4 or itype == 5 or itype == 6:
-                cur_off = cur_off + acnt * 4
-            elif itype == 10 or itype == 11 or itype == 12:
-                cur_off = cur_off + acnt * 8
-            elif itype == 8:
-                var ai: Int = 0
-                while ai < acnt:
-                    let elen: Int = read_u64_le(kv_buf, cur_off)
-                    cur_off = cur_off + 8 + elen
-                    ai = ai + 1
-        kvi = kvi + 1
-
-    let kv_total_len: Int = cur_off
+    // Write original header + KVs with updated tensor count to destination
     let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_total_len)
     decay kv_buf
 
@@ -173,8 +167,6 @@ pub fn execute_gguf_slice(model: GgufModel, drop_list: Array<Int>, out_path: Str
     while st_i < len(surviving_tensors):
         let st: GgufTensor = surviving_tensors[st_i]
         let tname: String = st.name
-        let tn_len: Int = len(tname)
-
         let tname_bytes: Array<Int> = bytes_of_str(tname)
         let tn_len: Int = len(tname_bytes)
 

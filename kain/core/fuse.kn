@@ -1,0 +1,65 @@
+// ============================================================================
+// fuse.kn — LoRA Weight Fusion Engine for juicer.kn
+//
+// Fuses low-rank adapters (e.g. 4-Step Lightning, Motion LoRAs) directly
+// into GGUF model weights:
+//   1. Full-rank biases & LayerNorms: exact additive fusion (F32/F16)
+//   2. Factorized weights (lora_up x lora_down): GPU Tensor Core GEMM + Q4_K quant
+//   3. Unified Slicing: optionally excises dead blocks in the same pass
+// ============================================================================
+
+use std::runtime
+use std::text
+use std::bytes
+use std::os
+
+@extern
+fn system(cmd: String) -> Int
+
+pub fn execute_lora_fuse(base_path: String, lora_path: String, strength: Float, drop_list: Array<Int>, out_path: String) -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — LoRA Weight Fusion Engine")
+    println("================================================================================")
+    println(" Base Model:   " + base_path)
+    println(" LoRA File:    " + lora_path)
+    println(" Strength:     " + format_2dp(strength))
+    println(" Output:       " + out_path)
+
+    var drop_csv: String = ""
+    var di: Int = 0
+    while di < len(drop_list):
+        if di > 0:
+            drop_csv = drop_csv + ","
+        drop_csv = drop_csv + str(drop_list[di])
+        di = di + 1
+
+    if len(drop_list) > 0:
+        println(" Slicing:      Dropping " + str(len(drop_list)) + " blocks (" + drop_csv + ")")
+
+    // Interpreter resolution order (never hardcode a drive letter permanently):
+    //   1. $JUICER_PY        — explicit override, wins everywhere
+    //   2. $JUICER_COMFY_PY  — machine-local CUDA-enabled interpreter
+    //   3. "python" on PATH
+    var py_bin: String = os_getenv_default("JUICER_PY", "")
+    if len(py_bin) == 0:
+        let comfy_py: String = os_getenv_default("JUICER_COMFY_PY", "S:/Local/ComfyUI_windows_portable/python_embeded/python.exe")
+        let h_chk: ptr<Void> = k_open_read(comfy_py)
+        if k_handle_bad(h_chk) == 0:
+            let _c: Int = k_CloseHandle(h_chk)
+            py_bin = comfy_py
+        else:
+            py_bin = "python"
+
+    // Construct command line using explicit cmd.exe wrapper for Windows path fidelity
+    var cmd: String = "C:\\Windows\\System32\\cmd.exe /c \"\"" + py_bin + "\" scripts/fuse_engine.py \"" + base_path + "\" \"" + lora_path + "\" --strength " + format_2dp(strength) + " --out \"" + out_path + "\""
+    if len(drop_csv) > 0:
+        cmd = cmd + " --drop " + drop_csv
+    cmd = cmd + "\""
+
+    println(" Engine:       Invoking CUDA Accelerated Tensor Core Pipeline ...")
+    let ret: Int = system(cmd)
+    if ret != 0:
+        println("fuse: execution failed with status " + str(ret))
+        return EXIT_ERROR
+
+    return EXIT_OK

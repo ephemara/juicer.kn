@@ -28,15 +28,20 @@ fn print_usage():
     println("COMMANDS:")
     println("  profile <model.gguf>                   Scan GGUF weights via 4 DSP lenses")
     println("                                         Outputs layer transfer functions & idling report")
+    println("  fuse <model.gguf> <lora.safetensors> [--strength 1.0] [--drop <list>] --out <fused.gguf>")
+    println("                                         Bake LoRA directly into model weights via CUDA")
+    println("                                         (Optionally slice/drop blocks in the same pass)")
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
     println("  schedule <model.gguf> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
-    println("  prove                                  Run 7-point in-memory formal verification battery")
+    println("  prove                                  Run 8-point in-memory formal verification battery")
     println("  help                                   Show this handbook\n")
     println("EXAMPLES:")
     println("  juicer profile models/diffusion_models/wan2.1-i2v-14b-480p-Q4_K_M.gguf")
+    println("  juicer fuse wan2.1-14b.gguf models/loras/lightning_4step.safetensors --out wan2.1-lightning.gguf")
+    println("  juicer fuse wan2.1-14b.gguf models/loras/lightning_4step.safetensors --drop 18,19,20,21 --out wan2.1-fast-36b.gguf")
     println("  juicer slice wan2.1-14b.gguf --drop 18,19,22,23,24,25,28,29 --out wan2.1-11.2b.gguf")
     println("  juicer schedule wan2.1-14b.gguf --steps 4 --out wan_step_recipe.json\n")
 
@@ -203,6 +208,32 @@ fn main() -> Int with Unsafe:
             println("error: profile requires a model path. usage: juicer profile <model.gguf>")
             return EXIT_ERROR
         return run_profile_command(args[1])
+
+    if cmd == "fuse":
+        if len(args) < 3:
+            println("error: fuse requires base model and lora path.")
+            println("usage: juicer fuse <model.gguf> <lora.safetensors> [--strength 1.0] [--drop <list>] --out <out.gguf>")
+            return EXIT_ERROR
+        let base_path: String = args[1]
+        let lora_path: String = args[2]
+        var strength: Float = 1.0
+        var drop_list: Array<Int> = []
+        var out_path: String = "fused_model.gguf"
+
+        var i: Int = 3
+        while i < len(args):
+            if args[i] == "--strength" and i + 1 < len(args):
+                strength = parse_float_text(args[i + 1])
+                i = i + 1
+            elif args[i] == "--drop" and i + 1 < len(args):
+                drop_list = parse_comma_int_list(args[i + 1])
+                i = i + 1
+            elif args[i] == "--out" and i + 1 < len(args):
+                out_path = args[i + 1]
+                i = i + 1
+            i = i + 1
+
+        return execute_lora_fuse(base_path, lora_path, strength, drop_list, out_path)
 
     if cmd == "slice":
         if len(args) < 2:
