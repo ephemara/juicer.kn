@@ -161,36 +161,52 @@ pub fn parse_safetensors_model(path: String) -> SafetensorsModel with Unsafe:
                         break
                     p_dt = p_dt + 1
 
-                // Parse data_offsets: [begin, end]
+                // Parse shape: [d0, d1, ...] — first up to 4 dims
+                var s_d0: Int = 1
+                var s_d1: Int = 1
+                var s_d2: Int = 1
+                var s_d3: Int = 1
+                var s_nd: Int = 0
+                var p_sh: Int = obj_start
+                while p_sh < obj_end - 7:
+                    if bref(json_buf, p_sh) == 115 and bref(json_buf, p_sh + 1) == 104 and bref(json_buf, p_sh + 2) == 97 and bref(json_buf, p_sh + 3) == 112 and bref(json_buf, p_sh + 4) == 101:
+                        var sb: Int = p_sh + 5
+                        while sb < obj_end and bref(json_buf, sb) != 91:
+                            sb = sb + 1
+                        sb = sb + 1
+                        var dim_slot: Int = 0
+                        while sb < obj_end and bref(json_buf, sb) != 93:
+                            while sb < obj_end and (bref(json_buf, sb) < 48 or bref(json_buf, sb) > 57):
+                                if bref(json_buf, sb) == 93:
+                                    break
+                                sb = sb + 1
+                            if sb < obj_end and bref(json_buf, sb) == 93:
+                                break
+                            var dv: Int = 0
+                            while sb < obj_end and bref(json_buf, sb) >= 48 and bref(json_buf, sb) <= 57:
+                                dv = dv * 10 + (bref(json_buf, sb) - 48)
+                                sb = sb + 1
+                            if dim_slot == 0:
+                                s_d0 = dv
+                            elif dim_slot == 1:
+                                s_d1 = dv
+                            elif dim_slot == 2:
+                                s_d2 = dv
+                            elif dim_slot == 3:
+                                s_d3 = dv
+                            s_nd = s_nd + 1
+                            dim_slot = dim_slot + 1
+                            if dim_slot >= 4:
+                                break
+                        break
+                    p_sh = p_sh + 1
+
+                // Parse data_offsets: [begin, end] directly from buffer bytes
                 var off_begin: Int = 0
                 var off_end: Int = 0
                 var p_off: Int = obj_start
                 while p_off < obj_end - 12:
                     if bref(json_buf, p_off) == 100 and bref(json_buf, p_off + 1) == 97 and bref(json_buf, p_off + 2) == 116 and bref(json_buf, p_off + 3) == 97 and bref(json_buf, p_off + 4) == 95 and bref(json_buf, p_off + 5) == 111:
-                        // find '['
-                        var ob: Int = p_off + 6
-                        while ob < obj_end and bref(json_buf, ob) != 91:
-                            ob = ob + 1
-                        ob = ob + 1
-                        // read begin int
-                        while ob < obj_end and bref(json_buf, ob) <= 32:
-                            ob = ob + 1
-                        var b_chars: String = ""
-                        while ob < obj_end and bref(json_buf, ob) != 44 and bref(json_buf, ob) > 32:
-                            b_chars = b_chars + char_at(str(bref(json_buf, ob)), 0) // read digit chars
-                            ob = ob + 1
-                        // comma
-                        while ob < obj_end and bref(json_buf, ob) != 44:
-                            ob = ob + 1
-                        ob = ob + 1
-                        // read end int
-                        while ob < obj_end and bref(json_buf, ob) <= 32:
-                            ob = ob + 1
-                        var e_chars: String = ""
-                        while ob < obj_end and bref(json_buf, ob) != 93 and bref(json_buf, ob) > 32:
-                            e_chars = e_chars + char_at(str(bref(json_buf, ob)), 0)
-                            ob = ob + 1
-
                         // parse numbers directly from buffer bytes
                         var num_b: Int = 0
                         var pb: Int = p_off
