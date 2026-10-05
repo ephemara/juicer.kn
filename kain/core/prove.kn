@@ -51,9 +51,11 @@ pub fn run_prove_battery() -> Int with Unsafe:
     let fp16_three: Int = fp32_to_fp16(3.0)
     let f16_one_dec: Float = fp16_to_fp32(fp16_one)
     let f16_three_dec: Float = fp16_to_fp32(fp16_three)
+    let f8_one_dec: Float = fp8_e4m3_to_fp32(64)
+    let f8_half_dec: Float = fp8_e4m3_to_fp32(56)
 
-    if math_abs(f_one - 1.0) < 0.001 and math_abs(f_three - 3.0) < 0.001 and math_abs(f16_one_dec - 1.0) < 0.001 and math_abs(f16_three_dec - 3.0) < 0.001:
-        println("PASS (FP32 1.0=" + str(f_one) + ", FP16 3.0=" + str(f16_three_dec) + ")")
+    if math_abs(f_one - 1.0) < 0.001 and math_abs(f_three - 3.0) < 0.001 and math_abs(f16_one_dec - 1.0) < 0.001 and math_abs(f16_three_dec - 3.0) < 0.001 and math_abs(f8_one_dec - 1.0) < 0.001 and math_abs(f8_half_dec - 0.5) < 0.001:
+        println("PASS (FP32 1.0=" + str(f_one) + ", FP16 3.0=" + str(f16_three_dec) + ", FP8 1.0=" + str(f8_one_dec) + ")")
     else:
         println("FAIL")
         failed = failed + 1
@@ -203,21 +205,21 @@ pub fn run_prove_battery() -> Int with Unsafe:
         println("FAIL (SNR=" + format_1dp(snr_q4) + " dB)")
         failed = failed + 1
 
-    // [11/11] SafeTensors Zero-Copy DMA Header Parser & Weight Decoder
-    print("[11/11] SafeTensors DMA Header Parser ... ")
-    let json_text: String = "{\"blocks.0.attn.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4,4],\"data_offsets\":[0,32]}}"
+    // [11/11] SafeTensors Zero-Copy DMA Header Parser & Direct GGUF Quantizer
+    print("[11/11] SafeTensors DMA Header & Direct GGUF Quantizer ... ")
+    let json_text: String = "{\"blocks.0.attn.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4,8],\"data_offsets\":[0,64]}}"
     let j_bytes: Array<Int> = bytes_of_str(json_text)
     let j_len: Int = len(j_bytes)
-    let total_file_len: Int = 8 + j_len + 32
+    let total_file_len: Int = 8 + j_len + 64
     let st_test_buf: ptr<Byte> = alloc_zeroed(total_file_len + 32, "Byte")
     write_u64_le(st_test_buf, 0, j_len)
     var ji: Int = 0
     while ji < j_len:
         bstore(st_test_buf, 8 + ji, j_bytes[ji])
         ji = ji + 1
-    // Write 16 BF16 floats of 1.0 (0x3F80)
+    // Write 32 BF16 floats of 1.0 (0x3F80)
     var wi: Int = 0
-    while wi < 16:
+    while wi < 32:
         bstore(st_test_buf, 8 + j_len + wi * 2, 128)
         bstore(st_test_buf, 8 + j_len + wi * 2 + 1, 63)
         wi = wi + 1
@@ -233,12 +235,24 @@ pub fn run_prove_battery() -> Int with Unsafe:
         if st_model.tensors[0].name == "blocks.0.attn.proj.weight" and st_model.tensors[0].dtype == "BF16":
             let h_st: ptr<Void> = k_open_read(test_st_path)
             s_floats = read_safetensors_weight_sample(h_st, st_model, 0, 16)
+            let dense_st: BlockDenseStats = compute_safetensors_block_dense_stats(h_st, st_model, 0, 16)
             let _c_st: Int = k_CloseHandle(h_st)
-            if len(s_floats) == 16 and math_abs(s_floats[0] - 1.0) < 0.01:
-                st_pass = 1
+            if len(s_floats) == 16 and math_abs(s_floats[0] - 1.0) < 0.01 and math_abs(dense_st.rms_energy - 1.0) < 0.01:
+                // Test 100% native Pure Kain Direct SafeTensors -> GGUF Quantizer
+                let test_gguf_path: String = ".kain/test_micro.gguf"
+                let q_res: Int = execute_safetensors_quantize(st_model, "q4_0", test_gguf_path)
+                if q_res == EXIT_OK:
+                    let parsed_gguf: GgufModel = parse_gguf_model(test_gguf_path)
+                    if parsed_gguf.tensor_count == 1 and parsed_gguf.block_count == 1:
+                        if parsed_gguf.tensors[0].type_id == 2: // Q4_0
+                            let h_gg: ptr<Void> = k_open_read(test_gguf_path)
+                            let dense_gg: BlockDenseStats = compute_gguf_block_dense_stats(h_gg, parsed_gguf, 0, 16)
+                            let _c_gg: Int = k_CloseHandle(h_gg)
+                            if math_abs(dense_gg.rms_energy - 1.0) < 0.15:
+                                st_pass = 1
 
     if st_pass == 1:
-        println("PASS (1 tensor, blocks.0, BF16 1.0=" + format_1dp(1.0) + ")")
+        println("PASS (SafeTensors DMA -> Direct GGUF Q4_0 Verified)")
     else:
         println("FAIL (tensor_count=" + str(st_model.tensor_count) + ", sz=" + str(st_model.tensors[0].size_bytes) + ", dt=" + st_model.tensors[0].dtype + ", n_floats=" + str(len(s_floats)) + ")")
         failed = failed + 1

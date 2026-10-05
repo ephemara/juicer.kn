@@ -187,3 +187,58 @@ pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim:
         is_all_pass: all_pass,
         prune_recommendation: rec,
     }
+
+// Dense whole-block spectral evaluation using true Frobenius energy, condition number, and exact kurtosis
+pub fn evaluate_spectral_dense(stats: BlockDenseStats, dim: Int) -> SpectralVerdict with Unsafe:
+    let n: Int = len(stats.sample)
+    if stats.total_elements <= 0 or n <= 0:
+        return SpectralVerdict {
+            block_idx: stats.block_idx,
+            spectral_radius: 1.0,
+            condition_number: 1.0,
+            delta_gain_db: 0.0,
+            kurtosis: 3.0,
+            is_all_pass: 0,
+            prune_recommendation: "ACTIVE",
+        }
+
+    // Power iteration on stratified multi-projection sample
+    var rho: Float = spectral_power_iteration(stats.sample, dim, 12)
+    if rho <= 0.000001:
+        rho = stats.rms_energy * math_sqrt(dim as Float)
+
+    // True dense kurtosis from whole-block census
+    let kurt: Float = stats.kurtosis
+
+    // Condition number kappa
+    var kappa: Float = 1.0
+    if rho > 0.000001:
+        kappa = (stats.max_abs * math_sqrt(dim as Float)) / rho
+    if kappa < 1.0:
+        kappa = 1.0
+
+    // Delta gain in dB from true whole-block Frobenius RMS energy
+    let gain_db: Float = stats.delta_gain_db
+
+    var all_pass: Int = 0
+    var rec: String = "ACTIVE"
+
+    // If Kurtosis is extreme (> 8.0), outlier channels carry critical representations (do not excise)
+    if kurt > 8.0:
+        rec = "PROTECTED (Outlier Channels)"
+    elif gain_db < (0.0 - 22.0) or (gain_db < (0.0 - 15.0) and kappa < 1.15):
+        all_pass = 1
+        rec = "EXCISE (All-Pass Idling)"
+    elif gain_db < (0.0 - 14.0):
+        rec = "CANDIDATE (Low Delta Gain)"
+
+    return SpectralVerdict {
+        block_idx: stats.block_idx,
+        spectral_radius: rho,
+        condition_number: kappa,
+        delta_gain_db: gain_db,
+        kurtosis: kurt,
+        is_all_pass: all_pass,
+        prune_recommendation: rec,
+    }
+

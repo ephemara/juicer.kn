@@ -23,3 +23,5 @@ comfy_server.log
 frame_*.png
 example_inspect.png
 /models_t_drive
+__pycache__/
+*.pyc

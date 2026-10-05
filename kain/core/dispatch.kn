@@ -2,10 +2,12 @@
 // dispatch.kn — juicer.kn Unified CLI Dispatcher & Master Entry Point
 //
 // Commands:
-//   juicer profile <model.gguf>               DSP Harmonic & Entropy Redundancy Profile
+//   juicer profile <model.gguf|.safetensors>  DSP Harmonic & Entropy Redundancy Profile
 //   juicer slice <model.gguf> --drop <list>   Zero-Copy Physical Layer Excision & Rewriter
-//   juicer schedule <model.gguf> --steps <N>  Dynamic Step-Adaptive Layer Skipping JSON
-//   juicer prove                              7-Instrument Formal Verification Battery
+//   juicer quantize <model.gguf> [--type q8_0|q4_0]  Native Block Re-quantizer (float sources)
+//   juicer fuse <model.gguf> <lora>           CUDA LoRA Fusion Engine (GGUF base)
+//   juicer schedule <model.gguf|.safetensors> --steps <N>  Step-Adaptive Skip JSON
+//   juicer prove                              11-Instrument Formal Verification Battery
 //   juicer help                               Operational Handbook
 // ============================================================================
 
@@ -26,19 +28,19 @@ fn print_usage():
     println("  juicer <command> [options...]")
     println("  jc <command> [options...]\n")
     println("COMMANDS:")
-    println("  profile <model.gguf>                   Scan GGUF weights via 4 DSP lenses")
+    println("  profile <model.gguf|.safetensors>      Scan weights via 4 DSP lenses (GGUF or raw BF16/F16/F32)")
     println("                                         Outputs layer transfer functions & idling report")
     println("  fuse <model.gguf> <lora.safetensors> [--strength 1.0] [--drop <list>] --out <fused.gguf>")
-    println("                                         Bake LoRA directly into model weights via CUDA")
+    println("                                         Bake LoRA directly into GGUF weights via CUDA")
     println("                                         (Optionally slice/drop blocks in the same pass)")
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
-    println("  quantize <model.gguf> [--type q8_0|q4_0] --out <out.gguf>")
-    println("                                         Native AVX2 GGUF block quantization & compression")
-    println("  schedule <model.gguf> --steps 4 --out <recipe.json>")
+    println("  quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q8_0] --out <out.gguf>")
+    println("                                         Native GGUF block re-quantizer & lossless LoRA fusion engine")
+    println("  schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
-    println("  prove                                  Run 8-point in-memory formal verification battery")
+    println("  prove                                  Run 11-point in-memory formal verification battery")
     println("  help                                   Show this handbook\n")
     println("EXAMPLES:")
     println("  juicer profile models/diffusion_models/wan2.1-i2v-14b-480p-Q4_K_M.gguf")
@@ -101,15 +103,16 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
     while bi < len(model.blocks):
         let blk: GgufBlock = model.blocks[bi]
         
-        // Stream real weights from disk via kernel32 DMA
-        var sample: Array<Float> = read_block_weight_sample(h_weights, model, blk.block_idx, 256)
+        // Dense weight streaming across all projection tensors in this block
+        let dense_stats: BlockDenseStats = compute_gguf_block_dense_stats(h_weights, model, blk.block_idx, 256)
+        var sample: Array<Float> = dense_stats.sample
         if len(sample) < 16:
             var si: Int = 0
             while si < 64:
                 push(sample, 0.0)
                 si = si + 1
 
-        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 16)
+        let spec: SpectralVerdict = evaluate_spectral_dense(dense_stats, 16)
         let ent: EntropyVerdict = evaluate_entropy_block(blk.block_idx, prev_h, sample)
         let bisp: BispectrumVerdict = evaluate_bispectrum_block(blk.block_idx, sample)
         prev_h = ent.perm_entropy
@@ -176,13 +179,17 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
             pad = pad - 1
         row = row + " | "
 
+        // Nomination requires BOTH lenses to agree (spectral all-pass AND entropy
+        // idling). A single-lens hit is a low-confidence CANDIDATE, never prunable.
         var verdict_str: String = "ACTIVE"
         if spec.kurtosis > 8.0:
             verdict_str = "PROTECTED (Outlier)"
-        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+        elif spec.is_all_pass == 1 and ent.is_idling == 1:
             verdict_str = "EXCISE (Candidate)"
             push(prunable_blocks, blk.block_idx)
             prunable_bytes = prunable_bytes + blk.total_bytes
+        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+            verdict_str = "CANDIDATE (1 lens)"
         elif spec.delta_gain_db < (0.0 - 15.0):
             verdict_str = "LOW_ENERGY"
         elif bisp.verdict == "HIGH INTERMODULATION DISTORTION":
@@ -251,15 +258,16 @@ fn run_safetensors_profile_command(model_path: String) -> Int with Unsafe:
     while bi < len(model.blocks):
         let blk: SafetensorsBlock = model.blocks[bi]
         
-        // Stream raw unquantized floats from disk via kernel32 DMA
-        var sample: Array<Float> = read_safetensors_weight_sample(h_weights, model, blk.block_idx, 256)
+        // Dense raw float streaming across all projection tensors in this block
+        let dense_stats: BlockDenseStats = compute_safetensors_block_dense_stats(h_weights, model, blk.block_idx, 256)
+        var sample: Array<Float> = dense_stats.sample
         if len(sample) < 16:
             var si: Int = 0
             while si < 64:
                 push(sample, 0.0)
                 si = si + 1
 
-        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 16)
+        let spec: SpectralVerdict = evaluate_spectral_dense(dense_stats, 16)
         let ent: EntropyVerdict = evaluate_entropy_block(blk.block_idx, prev_h, sample)
         let bisp: BispectrumVerdict = evaluate_bispectrum_block(blk.block_idx, sample)
         prev_h = ent.perm_entropy
@@ -326,13 +334,17 @@ fn run_safetensors_profile_command(model_path: String) -> Int with Unsafe:
             pad = pad - 1
         row = row + " | "
 
+        // Nomination requires BOTH lenses to agree (spectral all-pass AND entropy
+        // idling). A single-lens hit is a low-confidence CANDIDATE, never prunable.
         var verdict_str: String = "ACTIVE"
         if spec.kurtosis > 8.0:
             verdict_str = "PROTECTED (Outlier)"
-        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+        elif spec.is_all_pass == 1 and ent.is_idling == 1:
             verdict_str = "EXCISE (Candidate)"
             push(prunable_blocks, blk.block_idx)
             prunable_bytes = prunable_bytes + blk.total_bytes
+        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+            verdict_str = "CANDIDATE (1 lens)"
         elif spec.delta_gain_db < (0.0 - 15.0):
             verdict_str = "LOW_ENERGY"
         elif bisp.verdict == "HIGH INTERMODULATION DISTORTION":
@@ -445,11 +457,12 @@ fn main() -> Int with Unsafe:
 
     if cmd == "quantize":
         if len(args) < 2:
-            println("error: quantize requires a model path. usage: juicer quantize <model.gguf> [--type q8_0|q4_0] --out <quant.gguf>")
+            println("error: quantize requires a model path. usage: juicer quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q8_0|q4_0] --out <quant.gguf>")
             return EXIT_ERROR
         let model_path: String = args[1]
-        var target_type: String = "q8_0"
+        var target_type: String = "q4_k"
         var out_path: String = "quantized_model.gguf"
+        var lora_args_cmd: String = ""
 
         var i: Int = 2
         while i < len(args):
@@ -459,7 +472,29 @@ fn main() -> Int with Unsafe:
             elif args[i] == "--out" and i + 1 < len(args):
                 out_path = args[i + 1]
                 i = i + 1
+            elif args[i] == "--lora" and i + 1 < len(args):
+                lora_args_cmd = lora_args_cmd + " --lora \"" + args[i + 1] + "\""
+                i = i + 1
             i = i + 1
+
+        if str_ends_with(model_path, ".safetensors") == 1:
+            // If target_type is q4_0, q8_0, or default, and no --lora adapter is specified,
+            // execute 100% native Pure Kain Direct SafeTensors -> GGUF quantizer.
+            // If CUDA Q4_K or LoRA baking is requested, route to the Python Tensor-Core engine.
+            if len(lora_args_cmd) == 0 and (target_type == "q4_0" or target_type == "q8_0" or target_type == "q4"):
+                let st_model: SafetensorsModel = parse_safetensors_model(model_path)
+                if st_model.file_size <= 0:
+                    println("quantize: failed to load SafeTensors model " + model_path)
+                    return EXIT_ERROR
+                return execute_safetensors_quantize(st_model, target_type, out_path)
+
+            let py_bin: String = resolve_juicer_python()
+            var cmd_py: String = "C:\\Windows\\System32\\cmd.exe /c \"\"" + py_bin + "\" scripts/quantize_engine.py \"" + model_path + "\" --type " + target_type + " --out \"" + out_path + "\"" + lora_args_cmd + "\"\""
+            let ret: Int = system(cmd_py)
+            if ret != 0:
+                println("quantize: execution failed with status " + str(ret))
+                return EXIT_ERROR
+            return EXIT_OK
 
         let model: GgufModel = parse_gguf_model(model_path)
         if model.file_size <= 0:
@@ -469,7 +504,7 @@ fn main() -> Int with Unsafe:
 
     if cmd == "schedule":
         if len(args) < 2:
-            println("error: schedule requires a model path. usage: juicer schedule <model.gguf> --steps 4 --out <recipe.json>")
+            println("error: schedule requires a model path. usage: juicer schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
             return EXIT_ERROR
         let model_path: String = args[1]
         var steps: Int = 4
@@ -484,6 +519,13 @@ fn main() -> Int with Unsafe:
                 out_path = args[i + 1]
                 i = i + 1
             i = i + 1
+
+        if str_ends_with(model_path, ".safetensors") == 1:
+            let st_model: SafetensorsModel = parse_safetensors_model(model_path)
+            if st_model.file_size <= 0:
+                println("schedule: failed to load model " + model_path)
+                return EXIT_ERROR
+            return emit_schedule_json_st(st_model, steps, out_path)
 
         let model: GgufModel = parse_gguf_model(model_path)
         if model.file_size <= 0:

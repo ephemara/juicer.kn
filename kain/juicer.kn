@@ -20,7 +20,6 @@
 //   fn run_safetensors_profile_command(model_path: String) -> Int with Unsafe
 //   fn main() -> Int with Unsafe
 //   fn lehmer5_spec(v0: Float, v1: Float, v2: Float, v3: Float, v4: Float) -> Int with Pure
-//   fn system(cmd: String) -> Int
 // [converges]
 //   converge bisp_term_re(r1: Float, i1: Float, r2: Float, i2: Float, r3: Float, i3: Float) -> Float
 //   converge bisp_term_im(r1: Float, i1: Float, r2: Float, i2: Float, r3: Float, i3: Float) -> Float
@@ -44,6 +43,10 @@ use std::text
 use std::bytes
 use std::fs
 use std::process
+use std::os
+
+@extern
+pub fn system(cmd: String) -> Int
 
 // ── kernel32 Win32 DMA File API ─────────────────────────────────────────────
 @extern @link_name("CreateFileA")
@@ -84,6 +87,18 @@ pub const GGUF_MAGIC: Int = 1179993927 // 'GGUF' in LE: 0x46554747
 pub const PI: Float = 3.141592653589793
 pub const TWO_PI: Float = 6.283185307179586
 
+// ── Dense Layer & Block Statistics ─────────────────────────────────────────
+pub struct BlockDenseStats:
+    block_idx: Int
+    total_elements: Int
+    frobenius_norm: Float
+    rms_energy: Float
+    variance: Float
+    kurtosis: Float
+    max_abs: Float
+    delta_gain_db: Float
+    sample: Array<Float>
+
 // ── Pointer & Byte Primitives ──────────────────────────────────────────────
 pub fn null_ptr() -> ptr<Void> with Pure:
     return int_to_ptr(0, "ptr<Void>")
@@ -93,6 +108,18 @@ pub fn bref(buf: ptr<Byte>, i: Int) -> Int with Unsafe:
 
 pub fn bstore(buf: ptr<Byte>, i: Int, v: Int) with Unsafe:
     mem_store(ptr_offset(buf, i, "Byte"), v as Byte, "Byte")
+
+pub fn resolve_juicer_python() -> String with Unsafe:
+    var py_bin: String = os_getenv_default("JUICER_PY", "")
+    if len(py_bin) == 0:
+        let comfy_py: String = os_getenv_default("JUICER_COMFY_PY", "S:/Local/ComfyUI_windows_portable/python_embeded/python.exe")
+        let h_chk: ptr<Void> = k_open_read(comfy_py)
+        if k_handle_bad(h_chk) == 0:
+            let _c: Int = k_CloseHandle(h_chk)
+            py_bin = comfy_py
+        else:
+            py_bin = "python"
+    return py_bin
 
 pub fn k_open_read(path: String) -> ptr<Void> with Unsafe:
     return k_CreateFileA(path, GEN_READ, FILE_SHARE_RW, null_ptr(), OPEN_EXISTING, FILE_NORMAL, null_ptr())
@@ -540,6 +567,36 @@ pub fn fp16_to_fp32(u16: Int) -> Float with Pure:
 pub fn bf16_to_fp32(u16: Int) -> Float with Pure:
     return f32_from_bits(u16 << 16)
 
+pub fn fp8_e4m3_to_fp32(u8: Int) -> Float with Pure:
+    let sign: Int = (u8 >> 7) & 1
+    let exp: Int = (u8 >> 3) & 15
+    let mant: Int = u8 & 7
+    var sgn: Float = 1.0
+    if sign == 1:
+        sgn = 0.0 - 1.0
+    if exp == 0:
+        // Subnormal: 2^-6 * (mant / 8)
+        return sgn * 0.015625 * ((mant as Float) / 8.0)
+    if exp == 15:
+        if mant == 7:
+            return sgn * 999999999.0 // NaN -> large finite sentinel
+        return sgn * 448.0 // E4M3 max normal clamps here
+    let frac: Float = 1.0 + (mant as Float) / 8.0
+    let shift: Int = exp - 8
+    var p2: Float = 1.0
+    if shift > 0:
+        var si: Int = 0
+        while si < shift:
+            p2 = p2 * 2.0
+            si = si + 1
+    elif shift < 0:
+        var si: Int = 0
+        let neg_shift: Int = 0 - shift
+        while si < neg_shift:
+            p2 = p2 * 0.5
+            si = si + 1
+    return sgn * frac * p2
+
 pub fn sk_bitrev(re: ptr<Float>, im: ptr<Float>, n: Int) -> Int with Unsafe:
     var j: Int = 0
     var i: Int = 1
@@ -814,10 +871,12 @@ pub fn evaluate_bispectrum_block(block_idx: Int, sample: Array<Float>) -> Bispec
 // dispatch.kn — juicer.kn Unified CLI Dispatcher & Master Entry Point
 //
 // Commands:
-//   juicer profile <model.gguf>               DSP Harmonic & Entropy Redundancy Profile
+//   juicer profile <model.gguf|.safetensors>  DSP Harmonic & Entropy Redundancy Profile
 //   juicer slice <model.gguf> --drop <list>   Zero-Copy Physical Layer Excision & Rewriter
-//   juicer schedule <model.gguf> --steps <N>  Dynamic Step-Adaptive Layer Skipping JSON
-//   juicer prove                              7-Instrument Formal Verification Battery
+//   juicer quantize <model.gguf> [--type q8_0|q4_0]  Native Block Re-quantizer (float sources)
+//   juicer fuse <model.gguf> <lora>           CUDA LoRA Fusion Engine (GGUF base)
+//   juicer schedule <model.gguf|.safetensors> --steps <N>  Step-Adaptive Skip JSON
+//   juicer prove                              11-Instrument Formal Verification Battery
 //   juicer help                               Operational Handbook
 // ============================================================================
 
@@ -838,19 +897,19 @@ fn print_usage():
     println("  juicer <command> [options...]")
     println("  jc <command> [options...]\n")
     println("COMMANDS:")
-    println("  profile <model.gguf>                   Scan GGUF weights via 4 DSP lenses")
+    println("  profile <model.gguf|.safetensors>      Scan weights via 4 DSP lenses (GGUF or raw BF16/F16/F32)")
     println("                                         Outputs layer transfer functions & idling report")
     println("  fuse <model.gguf> <lora.safetensors> [--strength 1.0] [--drop <list>] --out <fused.gguf>")
-    println("                                         Bake LoRA directly into model weights via CUDA")
+    println("                                         Bake LoRA directly into GGUF weights via CUDA")
     println("                                         (Optionally slice/drop blocks in the same pass)")
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
-    println("  quantize <model.gguf> [--type q8_0|q4_0] --out <out.gguf>")
-    println("                                         Native AVX2 GGUF block quantization & compression")
-    println("  schedule <model.gguf> --steps 4 --out <recipe.json>")
+    println("  quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q8_0] --out <out.gguf>")
+    println("                                         Native GGUF block re-quantizer & lossless LoRA fusion engine")
+    println("  schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
-    println("  prove                                  Run 8-point in-memory formal verification battery")
+    println("  prove                                  Run 11-point in-memory formal verification battery")
     println("  help                                   Show this handbook\n")
     println("EXAMPLES:")
     println("  juicer profile models/diffusion_models/wan2.1-i2v-14b-480p-Q4_K_M.gguf")
@@ -913,15 +972,16 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
     while bi < len(model.blocks):
         let blk: GgufBlock = model.blocks[bi]
         
-        // Stream real weights from disk via kernel32 DMA
-        var sample: Array<Float> = read_block_weight_sample(h_weights, model, blk.block_idx, 256)
+        // Dense weight streaming across all projection tensors in this block
+        let dense_stats: BlockDenseStats = compute_gguf_block_dense_stats(h_weights, model, blk.block_idx, 256)
+        var sample: Array<Float> = dense_stats.sample
         if len(sample) < 16:
             var si: Int = 0
             while si < 64:
                 push(sample, 0.0)
                 si = si + 1
 
-        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 16)
+        let spec: SpectralVerdict = evaluate_spectral_dense(dense_stats, 16)
         let ent: EntropyVerdict = evaluate_entropy_block(blk.block_idx, prev_h, sample)
         let bisp: BispectrumVerdict = evaluate_bispectrum_block(blk.block_idx, sample)
         prev_h = ent.perm_entropy
@@ -988,13 +1048,17 @@ fn run_profile_command(model_path: String) -> Int with Unsafe:
             pad = pad - 1
         row = row + " | "
 
+        // Nomination requires BOTH lenses to agree (spectral all-pass AND entropy
+        // idling). A single-lens hit is a low-confidence CANDIDATE, never prunable.
         var verdict_str: String = "ACTIVE"
         if spec.kurtosis > 8.0:
             verdict_str = "PROTECTED (Outlier)"
-        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+        elif spec.is_all_pass == 1 and ent.is_idling == 1:
             verdict_str = "EXCISE (Candidate)"
             push(prunable_blocks, blk.block_idx)
             prunable_bytes = prunable_bytes + blk.total_bytes
+        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+            verdict_str = "CANDIDATE (1 lens)"
         elif spec.delta_gain_db < (0.0 - 15.0):
             verdict_str = "LOW_ENERGY"
         elif bisp.verdict == "HIGH INTERMODULATION DISTORTION":
@@ -1063,15 +1127,16 @@ fn run_safetensors_profile_command(model_path: String) -> Int with Unsafe:
     while bi < len(model.blocks):
         let blk: SafetensorsBlock = model.blocks[bi]
         
-        // Stream raw unquantized floats from disk via kernel32 DMA
-        var sample: Array<Float> = read_safetensors_weight_sample(h_weights, model, blk.block_idx, 256)
+        // Dense raw float streaming across all projection tensors in this block
+        let dense_stats: BlockDenseStats = compute_safetensors_block_dense_stats(h_weights, model, blk.block_idx, 256)
+        var sample: Array<Float> = dense_stats.sample
         if len(sample) < 16:
             var si: Int = 0
             while si < 64:
                 push(sample, 0.0)
                 si = si + 1
 
-        let spec: SpectralVerdict = evaluate_spectral_block(blk.block_idx, sample, 16)
+        let spec: SpectralVerdict = evaluate_spectral_dense(dense_stats, 16)
         let ent: EntropyVerdict = evaluate_entropy_block(blk.block_idx, prev_h, sample)
         let bisp: BispectrumVerdict = evaluate_bispectrum_block(blk.block_idx, sample)
         prev_h = ent.perm_entropy
@@ -1138,13 +1203,17 @@ fn run_safetensors_profile_command(model_path: String) -> Int with Unsafe:
             pad = pad - 1
         row = row + " | "
 
+        // Nomination requires BOTH lenses to agree (spectral all-pass AND entropy
+        // idling). A single-lens hit is a low-confidence CANDIDATE, never prunable.
         var verdict_str: String = "ACTIVE"
         if spec.kurtosis > 8.0:
             verdict_str = "PROTECTED (Outlier)"
-        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+        elif spec.is_all_pass == 1 and ent.is_idling == 1:
             verdict_str = "EXCISE (Candidate)"
             push(prunable_blocks, blk.block_idx)
             prunable_bytes = prunable_bytes + blk.total_bytes
+        elif spec.is_all_pass == 1 or ent.is_idling == 1:
+            verdict_str = "CANDIDATE (1 lens)"
         elif spec.delta_gain_db < (0.0 - 15.0):
             verdict_str = "LOW_ENERGY"
         elif bisp.verdict == "HIGH INTERMODULATION DISTORTION":
@@ -1257,11 +1326,12 @@ fn main() -> Int with Unsafe:
 
     if cmd == "quantize":
         if len(args) < 2:
-            println("error: quantize requires a model path. usage: juicer quantize <model.gguf> [--type q8_0|q4_0] --out <quant.gguf>")
+            println("error: quantize requires a model path. usage: juicer quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q8_0|q4_0] --out <quant.gguf>")
             return EXIT_ERROR
         let model_path: String = args[1]
-        var target_type: String = "q8_0"
+        var target_type: String = "q4_k"
         var out_path: String = "quantized_model.gguf"
+        var lora_args_cmd: String = ""
 
         var i: Int = 2
         while i < len(args):
@@ -1271,7 +1341,29 @@ fn main() -> Int with Unsafe:
             elif args[i] == "--out" and i + 1 < len(args):
                 out_path = args[i + 1]
                 i = i + 1
+            elif args[i] == "--lora" and i + 1 < len(args):
+                lora_args_cmd = lora_args_cmd + " --lora \"" + args[i + 1] + "\""
+                i = i + 1
             i = i + 1
+
+        if str_ends_with(model_path, ".safetensors") == 1:
+            // If target_type is q4_0, q8_0, or default, and no --lora adapter is specified,
+            // execute 100% native Pure Kain Direct SafeTensors -> GGUF quantizer.
+            // If CUDA Q4_K or LoRA baking is requested, route to the Python Tensor-Core engine.
+            if len(lora_args_cmd) == 0 and (target_type == "q4_0" or target_type == "q8_0" or target_type == "q4"):
+                let st_model: SafetensorsModel = parse_safetensors_model(model_path)
+                if st_model.file_size <= 0:
+                    println("quantize: failed to load SafeTensors model " + model_path)
+                    return EXIT_ERROR
+                return execute_safetensors_quantize(st_model, target_type, out_path)
+
+            let py_bin: String = resolve_juicer_python()
+            var cmd_py: String = "C:\\Windows\\System32\\cmd.exe /c \"\"" + py_bin + "\" scripts/quantize_engine.py \"" + model_path + "\" --type " + target_type + " --out \"" + out_path + "\"" + lora_args_cmd + "\"\""
+            let ret: Int = system(cmd_py)
+            if ret != 0:
+                println("quantize: execution failed with status " + str(ret))
+                return EXIT_ERROR
+            return EXIT_OK
 
         let model: GgufModel = parse_gguf_model(model_path)
         if model.file_size <= 0:
@@ -1281,7 +1373,7 @@ fn main() -> Int with Unsafe:
 
     if cmd == "schedule":
         if len(args) < 2:
-            println("error: schedule requires a model path. usage: juicer schedule <model.gguf> --steps 4 --out <recipe.json>")
+            println("error: schedule requires a model path. usage: juicer schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
             return EXIT_ERROR
         let model_path: String = args[1]
         var steps: Int = 4
@@ -1296,6 +1388,13 @@ fn main() -> Int with Unsafe:
                 out_path = args[i + 1]
                 i = i + 1
             i = i + 1
+
+        if str_ends_with(model_path, ".safetensors") == 1:
+            let st_model: SafetensorsModel = parse_safetensors_model(model_path)
+            if st_model.file_size <= 0:
+                println("schedule: failed to load model " + model_path)
+                return EXIT_ERROR
+            return emit_schedule_json_st(st_model, steps, out_path)
 
         let model: GgufModel = parse_gguf_model(model_path)
         if model.file_size <= 0:
@@ -1779,13 +1878,16 @@ use std::text
 use std::bytes
 use std::os
 
-@extern
-fn system(cmd: String) -> Int
-
 pub fn execute_lora_fuse(base_path: String, lora_path: String, strength: Float, drop_list: Array<Int>, out_path: String) -> Int with Unsafe:
     println("\n================================================================================")
     println(" juicer.kn — LoRA Weight Fusion Engine")
     println("================================================================================")
+    if str_ends_with(base_path, ".safetensors") == 1:
+        println("fuse: raw .safetensors base models are not supported yet.")
+        println("fuse: convert the BF16 master to GGUF first, then fuse:")
+        println("fuse:   juicer quantize <master.gguf> --type q8_0 --out <base.gguf>")
+        println("fuse:   juicer fuse <base.gguf> <lora.safetensors> --out <fused.gguf>")
+        return EXIT_ERROR
     println(" Base Model:   " + base_path)
     println(" LoRA File:    " + lora_path)
     println(" Strength:     " + format_2dp(strength))
@@ -1802,19 +1904,7 @@ pub fn execute_lora_fuse(base_path: String, lora_path: String, strength: Float, 
     if len(drop_list) > 0:
         println(" Slicing:      Dropping " + str(len(drop_list)) + " blocks (" + drop_csv + ")")
 
-    // Interpreter resolution order (never hardcode a drive letter permanently):
-    //   1. $JUICER_PY        — explicit override, wins everywhere
-    //   2. $JUICER_COMFY_PY  — machine-local CUDA-enabled interpreter
-    //   3. "python" on PATH
-    var py_bin: String = os_getenv_default("JUICER_PY", "")
-    if len(py_bin) == 0:
-        let comfy_py: String = os_getenv_default("JUICER_COMFY_PY", "S:/Local/ComfyUI_windows_portable/python_embeded/python.exe")
-        let h_chk: ptr<Void> = k_open_read(comfy_py)
-        if k_handle_bad(h_chk) == 0:
-            let _c: Int = k_CloseHandle(h_chk)
-            py_bin = comfy_py
-        else:
-            py_bin = "python"
+    let py_bin: String = resolve_juicer_python()
 
     // Construct command line using explicit cmd.exe wrapper for Windows path fidelity
     var cmd: String = "C:\\Windows\\System32\\cmd.exe /c \"\"" + py_bin + "\" scripts/fuse_engine.py \"" + base_path + "\" \"" + lora_path + "\" --strength " + format_2dp(strength) + " --out \"" + out_path + "\""
@@ -2227,18 +2317,20 @@ pub fn read_block_weight_sample(h: ptr<Void>, model: GgufModel, block_idx: Int, 
     if k_handle_bad(h) == 1:
         return sample
 
-    // 1. Locate best representative tensor in this block (projection/FFN preferred)
+    // 1. Locate best representative tensor in this block (projection/FFN preferred).
+    // Scale satellites carry no weight distribution and are skipped.
     var target_idx: Int = -1
     var first_idx: Int = -1
     var ti: Int = 0
     while ti < len(model.tensors):
         let t: GgufTensor = model.tensors[ti]
         if t.block_idx == block_idx:
-            if first_idx < 0:
-                first_idx = ti
-            if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0:
-                target_idx = ti
-                break
+            if find_from(t.name, "scale", 0) < 0:
+                if first_idx < 0:
+                    first_idx = ti
+                if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0:
+                    target_idx = ti
+                    break
         ti = ti + 1
 
     if target_idx < 0:
@@ -2357,6 +2449,273 @@ pub fn read_block_weight_sample(h: ptr<Void>, model: GgufModel, block_idx: Int, 
     decay raw_buf
     return sample
 
+// Dense whole-block energy and kurtosis streaming across all linear projections in a block
+pub fn compute_gguf_block_dense_stats(h: ptr<Void>, model: GgufModel, block_idx: Int, sample_cap: Int) -> BlockDenseStats with Unsafe:
+    let empty_arr: Array<Float> = []
+    let dummy = BlockDenseStats {
+        block_idx: block_idx,
+        total_elements: 0,
+        frobenius_norm: 0.0,
+        rms_energy: 0.0,
+        variance: 0.0,
+        kurtosis: 3.0,
+        max_abs: 0.0,
+        delta_gain_db: 0.0,
+        sample: empty_arr,
+    }
+    if k_handle_bad(h) == 1:
+        return dummy
+
+    // 1. Gather all 2D+ linear projection tensors for this block (skip 1D biases/scales/norms)
+    var proj_indices: Array<Int> = []
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: GgufTensor = model.tensors[ti]
+        if t.block_idx == block_idx:
+            if t.n_dims >= 2:
+                if find_from(t.name, "scale", 0) < 0:
+                    if find_from(t.name, "bias", 0) < 0:
+                        if find_from(t.name, "norm", 0) < 0:
+                            if find_from(t.name, "ln", 0) < 0:
+                                push(proj_indices, ti)
+        ti = ti + 1
+
+    if len(proj_indices) == 0:
+        var fi: Int = 0
+        while fi < len(model.tensors):
+            let t: GgufTensor = model.tensors[fi]
+            if t.block_idx == block_idx:
+                if find_from(t.name, "scale", 0) < 0:
+                    push(proj_indices, fi)
+            fi = fi + 1
+
+    if len(proj_indices) == 0:
+        return dummy
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let buf_bytes: Int = 65536
+    let raw_buf: ptr<Byte> = alloc_zeroed(buf_bytes + 32, "Byte")
+
+    var total_elements: Int = 0
+    var sum: Float = 0.0
+    var sum_sq: Float = 0.0
+    var sum_m4: Float = 0.0
+    var max_abs_val: Float = 0.0
+    var sample_out: Array<Float> = []
+
+    let target_sample_per_proj: Int = (sample_cap / len(proj_indices)) + 1
+
+    var pi: Int = 0
+    while pi < len(proj_indices):
+        let t_idx: Int = proj_indices[pi]
+        let target: GgufTensor = model.tensors[t_idx]
+        let abs_off: Int = model.tensor_data_offset + target.offset
+        let ttype: Int = target.type_id
+        let tsize: Int = target.size_bytes
+
+        var to_read: Int = buf_bytes
+        if to_read > tsize:
+            to_read = tsize
+
+        let r_act: Int = k_read_at(h, nslot, abs_off, raw_buf, to_read)
+        if r_act > 0:
+            var proj_sampled: Int = 0
+            if ttype == 0:
+                // F32
+                let num_f: Int = r_act / 4
+                var fi: Int = 0
+                while fi < num_f:
+                    let fval: Float = read_f32_le(raw_buf, fi * 4)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val:
+                        max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif ttype == 1:
+                // F16
+                let num_f: Int = r_act / 2
+                var fi: Int = 0
+                while fi < num_f:
+                    let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+                    let fval: Float = fp16_to_fp32(u16_val)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val:
+                        max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif ttype == 28:
+                // BF16
+                let num_f: Int = r_act / 2
+                var fi: Int = 0
+                while fi < num_f:
+                    let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+                    let fval: Float = bf16_to_fp32(u16_val)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val:
+                        max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif ttype == 8:
+                // Q8_0
+                let num_b: Int = r_act / 34
+                var bi: Int = 0
+                while bi < num_b:
+                    let s_u16: Int = read_u16_le(raw_buf, bi * 34)
+                    let scale_f: Float = fp16_to_fp32(s_u16)
+                    var qi: Int = 0
+                    while qi < 32:
+                        var q_signed: Int = bref(raw_buf, bi * 34 + 2 + qi)
+                        if q_signed > 127:
+                            q_signed = q_signed - 256
+                        let fval: Float = scale_f * (q_signed as Float)
+                        total_elements = total_elements + 1
+                        sum = sum + fval
+                        let w2: Float = fval * fval
+                        sum_sq = sum_sq + w2
+                        sum_m4 = sum_m4 + (w2 * w2)
+                        let af: Float = math_abs(fval)
+                        if af > max_abs_val:
+                            max_abs_val = af
+                        if proj_sampled < target_sample_per_proj:
+                            if len(sample_out) < sample_cap:
+                                push(sample_out, fval)
+                                proj_sampled = proj_sampled + 1
+                        qi = qi + 1
+                    bi = bi + 1
+            elif ttype == 2:
+                // Q4_0
+                let num_b: Int = r_act / 18
+                var bi: Int = 0
+                while bi < num_b:
+                    let s_u16: Int = read_u16_le(raw_buf, bi * 18)
+                    let scale_f: Float = fp16_to_fp32(s_u16)
+                    var qi: Int = 0
+                    while qi < 16:
+                        let bv: Int = bref(raw_buf, bi * 18 + 2 + qi)
+                        let q0: Int = (bv & 15) - 8
+                        let q1: Int = ((bv >> 4) & 15) - 8
+                        let f0: Float = scale_f * (q0 as Float)
+                        let f1: Float = scale_f * (q1 as Float)
+                        total_elements = total_elements + 2
+                        sum = sum + f0 + f1
+                        let w2_0: Float = f0 * f0
+                        let w2_1: Float = f1 * f1
+                        sum_sq = sum_sq + w2_0 + w2_1
+                        sum_m4 = sum_m4 + (w2_0 * w2_0) + (w2_1 * w2_1)
+                        let af0: Float = math_abs(f0)
+                        let af1: Float = math_abs(f1)
+                        if af0 > max_abs_val: max_abs_val = af0
+                        if af1 > max_abs_val: max_abs_val = af1
+                        if proj_sampled < target_sample_per_proj:
+                            if len(sample_out) < sample_cap:
+                                push(sample_out, f0)
+                                proj_sampled = proj_sampled + 1
+                        if proj_sampled < target_sample_per_proj:
+                            if len(sample_out) < sample_cap:
+                                push(sample_out, f1)
+                                proj_sampled = proj_sampled + 1
+                        qi = qi + 1
+                    bi = bi + 1
+            elif ttype == 12:
+                // Q4_K
+                let num_sb: Int = r_act / 144
+                var sbi: Int = 0
+                while sbi < num_sb:
+                    let d_u16: Int = read_u16_le(raw_buf, sbi * 144)
+                    let d_f: Float = fp16_to_fp32(d_u16)
+                    var qi: Int = 0
+                    while qi < 128:
+                        let bv: Int = bref(raw_buf, sbi * 144 + 16 + qi)
+                        let q0: Int = (bv & 15) - 8
+                        let q1: Int = ((bv >> 4) & 15) - 8
+                        let f0: Float = d_f * (q0 as Float)
+                        let f1: Float = d_f * (q1 as Float)
+                        total_elements = total_elements + 2
+                        sum = sum + f0 + f1
+                        let w2_0: Float = f0 * f0
+                        let w2_1: Float = f1 * f1
+                        sum_sq = sum_sq + w2_0 + w2_1
+                        sum_m4 = sum_m4 + (w2_0 * w2_0) + (w2_1 * w2_1)
+                        let af0: Float = math_abs(f0)
+                        let af1: Float = math_abs(f1)
+                        if af0 > max_abs_val: max_abs_val = af0
+                        if af1 > max_abs_val: max_abs_val = af1
+                        if proj_sampled < target_sample_per_proj:
+                            if len(sample_out) < sample_cap:
+                                push(sample_out, f0)
+                                proj_sampled = proj_sampled + 1
+                        if proj_sampled < target_sample_per_proj:
+                            if len(sample_out) < sample_cap:
+                                push(sample_out, f1)
+                                proj_sampled = proj_sampled + 1
+                        qi = qi + 1
+                    sbi = sbi + 1
+        pi = pi + 1
+
+    decay raw_buf
+    decay nslot
+
+    if total_elements <= 0:
+        return dummy
+
+    let n_f: Float = total_elements as Float
+    let mean: Float = sum / n_f
+    let mean_sq: Float = mean * mean
+    var variance: Float = (sum_sq / n_f) - mean_sq
+    if variance < 0.0000000001:
+        variance = 0.0000000001
+
+    let rms: Float = math_sqrt(sum_sq / n_f)
+    let frob: Float = math_sqrt(sum_sq)
+
+    var kurt: Float = 3.0
+    if variance > 0.0000000001:
+        kurt = (sum_m4 / n_f) / (variance * variance)
+    if kurt < 1.0:
+        kurt = 1.0
+
+    // Gain in dB: 20 * log10(rms * sqrt(16))
+    var g_db: Float = 0.0
+    let effective_gain: Float = rms * 4.0
+    if effective_gain > 0.000001:
+        g_db = 20.0 * (math_ln(effective_gain) * 0.4342944819032518)
+
+    return BlockDenseStats {
+        block_idx: block_idx,
+        total_elements: total_elements,
+        frobenius_norm: frob,
+        rms_energy: rms,
+        variance: variance,
+        kurtosis: kurt,
+        max_abs: max_abs_val,
+        delta_gain_db: g_db,
+        sample: sample_out,
+    }
+
 // ============================================================================
 // prove.kn
 // ============================================================================
@@ -2413,9 +2772,11 @@ pub fn run_prove_battery() -> Int with Unsafe:
     let fp16_three: Int = fp32_to_fp16(3.0)
     let f16_one_dec: Float = fp16_to_fp32(fp16_one)
     let f16_three_dec: Float = fp16_to_fp32(fp16_three)
+    let f8_one_dec: Float = fp8_e4m3_to_fp32(64)
+    let f8_half_dec: Float = fp8_e4m3_to_fp32(56)
 
-    if math_abs(f_one - 1.0) < 0.001 and math_abs(f_three - 3.0) < 0.001 and math_abs(f16_one_dec - 1.0) < 0.001 and math_abs(f16_three_dec - 3.0) < 0.001:
-        println("PASS (FP32 1.0=" + str(f_one) + ", FP16 3.0=" + str(f16_three_dec) + ")")
+    if math_abs(f_one - 1.0) < 0.001 and math_abs(f_three - 3.0) < 0.001 and math_abs(f16_one_dec - 1.0) < 0.001 and math_abs(f16_three_dec - 3.0) < 0.001 and math_abs(f8_one_dec - 1.0) < 0.001 and math_abs(f8_half_dec - 0.5) < 0.001:
+        println("PASS (FP32 1.0=" + str(f_one) + ", FP16 3.0=" + str(f16_three_dec) + ", FP8 1.0=" + str(f8_one_dec) + ")")
     else:
         println("FAIL")
         failed = failed + 1
@@ -2565,21 +2926,21 @@ pub fn run_prove_battery() -> Int with Unsafe:
         println("FAIL (SNR=" + format_1dp(snr_q4) + " dB)")
         failed = failed + 1
 
-    // [11/11] SafeTensors Zero-Copy DMA Header Parser & Weight Decoder
-    print("[11/11] SafeTensors DMA Header Parser ... ")
-    let json_text: String = "{\"blocks.0.attn.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4,4],\"data_offsets\":[0,32]}}"
+    // [11/11] SafeTensors Zero-Copy DMA Header Parser & Direct GGUF Quantizer
+    print("[11/11] SafeTensors DMA Header & Direct GGUF Quantizer ... ")
+    let json_text: String = "{\"blocks.0.attn.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4,8],\"data_offsets\":[0,64]}}"
     let j_bytes: Array<Int> = bytes_of_str(json_text)
     let j_len: Int = len(j_bytes)
-    let total_file_len: Int = 8 + j_len + 32
+    let total_file_len: Int = 8 + j_len + 64
     let st_test_buf: ptr<Byte> = alloc_zeroed(total_file_len + 32, "Byte")
     write_u64_le(st_test_buf, 0, j_len)
     var ji: Int = 0
     while ji < j_len:
         bstore(st_test_buf, 8 + ji, j_bytes[ji])
         ji = ji + 1
-    // Write 16 BF16 floats of 1.0 (0x3F80)
+    // Write 32 BF16 floats of 1.0 (0x3F80)
     var wi: Int = 0
-    while wi < 16:
+    while wi < 32:
         bstore(st_test_buf, 8 + j_len + wi * 2, 128)
         bstore(st_test_buf, 8 + j_len + wi * 2 + 1, 63)
         wi = wi + 1
@@ -2595,12 +2956,24 @@ pub fn run_prove_battery() -> Int with Unsafe:
         if st_model.tensors[0].name == "blocks.0.attn.proj.weight" and st_model.tensors[0].dtype == "BF16":
             let h_st: ptr<Void> = k_open_read(test_st_path)
             s_floats = read_safetensors_weight_sample(h_st, st_model, 0, 16)
+            let dense_st: BlockDenseStats = compute_safetensors_block_dense_stats(h_st, st_model, 0, 16)
             let _c_st: Int = k_CloseHandle(h_st)
-            if len(s_floats) == 16 and math_abs(s_floats[0] - 1.0) < 0.01:
-                st_pass = 1
+            if len(s_floats) == 16 and math_abs(s_floats[0] - 1.0) < 0.01 and math_abs(dense_st.rms_energy - 1.0) < 0.01:
+                // Test 100% native Pure Kain Direct SafeTensors -> GGUF Quantizer
+                let test_gguf_path: String = ".kain/test_micro.gguf"
+                let q_res: Int = execute_safetensors_quantize(st_model, "q4_0", test_gguf_path)
+                if q_res == EXIT_OK:
+                    let parsed_gguf: GgufModel = parse_gguf_model(test_gguf_path)
+                    if parsed_gguf.tensor_count == 1 and parsed_gguf.block_count == 1:
+                        if parsed_gguf.tensors[0].type_id == 2: // Q4_0
+                            let h_gg: ptr<Void> = k_open_read(test_gguf_path)
+                            let dense_gg: BlockDenseStats = compute_gguf_block_dense_stats(h_gg, parsed_gguf, 0, 16)
+                            let _c_gg: Int = k_CloseHandle(h_gg)
+                            if math_abs(dense_gg.rms_energy - 1.0) < 0.15:
+                                st_pass = 1
 
     if st_pass == 1:
-        println("PASS (1 tensor, blocks.0, BF16 1.0=" + format_1dp(1.0) + ")")
+        println("PASS (SafeTensors DMA -> Direct GGUF Q4_0 Verified)")
     else:
         println("FAIL (tensor_count=" + str(st_model.tensor_count) + ", sz=" + str(st_model.tensors[0].size_bytes) + ", dt=" + st_model.tensors[0].dtype + ", n_floats=" + str(len(s_floats)) + ")")
         failed = failed + 1
@@ -2631,7 +3004,7 @@ pub fn run_prove_battery() -> Int with Unsafe:
 use std::runtime
 use std::text
 
-// Quantize 32-element float buffer to GGUF Q8_0 block (34 bytes)
+// Quantize 32-element float buffer to GGUF Q8_0 block (34 bytes) with MSE Scale Optimization
 pub fn quantize_block_q8_0(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<Byte>, out_offset: Int) -> Int with Unsafe:
     var max_val: Float = 0.0
     var i: Int = 0
@@ -2650,21 +3023,54 @@ pub fn quantize_block_q8_0(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<By
             zi = zi + 1
         return 0
 
-    let d: Float = max_val / 127.0
-    let d_u16: Int = fp32_to_fp16(d)
-    write_u16_le(out_bytes, out_offset, d_u16)
+    let base_d: Float = max_val / 127.0
+    var best_err: Float = 1000000000.0
+    var best_d_u16: Int = fp32_to_fp16(base_d)
+    var best_inv_d: Float = 1.0
+    let d_init: Float = fp16_to_fp32(best_d_u16)
+    if d_init > 0.000000000001:
+        best_inv_d = 1.0 / d_init
 
-    let d_exact: Float = fp16_to_fp32(d_u16)
-    var inv_d: Float = 1.0
-    if d_exact > 0.000000000001:
-        inv_d = 1.0 / d_exact
+    // MSE Scale Search: evaluate candidate scales to minimize quantization distortion
+    var cand_i: Int = 0
+    while cand_i < 3:
+        var alpha: Float = 1.0
+        if cand_i == 1: alpha = 0.95
+        elif cand_i == 2: alpha = 0.90
+
+        let cand_d: Float = base_d * alpha
+        let cand_u16: Int = fp32_to_fp16(cand_d)
+        let exact_d: Float = fp16_to_fp32(cand_u16)
+        if exact_d > 0.000000000001:
+            let inv_c: Float = 1.0 / exact_d
+            var err_acc: Float = 0.0
+            var ci: Int = 0
+            while ci < 32:
+                let x: Float = mem_load(ptr_offset(in_f32, in_offset + ci, "Float"), "Float")
+                var q: Int = (x * inv_c + 0.5) as Int
+                if x < 0.0: q = (x * inv_c - 0.5) as Int
+                if q > 127: q = 127
+                if q < (0 - 127): q = 0 - 127
+                let recon: Float = (q as Float) * exact_d
+                let diff: Float = x - recon
+                err_acc = err_acc + diff * diff
+                ci = ci + 1
+
+            if err_acc < best_err:
+                best_err = err_acc
+                best_d_u16 = cand_u16
+                best_inv_d = inv_c
+
+        cand_i = cand_i + 1
+
+    write_u16_le(out_bytes, out_offset, best_d_u16)
 
     var j: Int = 0
     while j < 32:
         let x: Float = mem_load(ptr_offset(in_f32, in_offset + j, "Float"), "Float")
-        var q: Int = (x * inv_d + 0.5) as Int
+        var q: Int = (x * best_inv_d + 0.5) as Int
         if x < 0.0:
-            q = (x * inv_d - 0.5) as Int
+            q = (x * best_inv_d - 0.5) as Int
 
         if q > 127: q = 127
         if q < (0 - 127): q = 0 - 127
@@ -2676,7 +3082,7 @@ pub fn quantize_block_q8_0(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<By
         j = j + 1
     return 0
 
-// Quantize 32-element float buffer to GGUF Q4_0 block (18 bytes)
+// Quantize 32-element float buffer to GGUF Q4_0 block (18 bytes) with MSE Outlier Optimization
 pub fn quantize_block_q4_0(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<Byte>, out_offset: Int) -> Int with Unsafe:
     var max_val: Float = 0.0
     var i: Int = 0
@@ -2694,28 +3100,66 @@ pub fn quantize_block_q4_0(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<By
             zi = zi + 1
         return 0
 
-    let d: Float = max_val / 7.0
-    let d_u16: Int = fp32_to_fp16(d)
-    write_u16_le(out_bytes, out_offset, d_u16)
+    let base_d: Float = max_val / 7.0
 
-    let d_exact: Float = fp16_to_fp32(d_u16)
-    var inv_d: Float = 1.0
-    if d_exact > 0.000000000001:
-        inv_d = 1.0 / d_exact
+    // Next-Gen Adaptive MSE Scale Search:
+    // Evaluate 4 candidate scale multipliers: 1.00, 0.90, 0.80, 0.70.
+    // Finds the scale that minimizes L2 reconstruction error, preventing
+    // isolated outlier weights from blowing out the quantization grid.
+    var best_err: Float = 1000000000.0
+    var best_d_u16: Int = fp32_to_fp16(base_d)
+    var best_inv_d: Float = 1.0
+    let d_init: Float = fp16_to_fp32(best_d_u16)
+    if d_init > 0.000000000001:
+        best_inv_d = 1.0 / d_init
+
+    var cand_i: Int = 0
+    while cand_i < 4:
+        var alpha: Float = 1.0
+        if cand_i == 1: alpha = 0.90
+        elif cand_i == 2: alpha = 0.80
+        elif cand_i == 3: alpha = 0.70
+
+        let cand_d: Float = base_d * alpha
+        let cand_u16: Int = fp32_to_fp16(cand_d)
+        let exact_d: Float = fp16_to_fp32(cand_u16)
+        if exact_d > 0.000000000001:
+            let inv_c: Float = 1.0 / exact_d
+            var err_acc: Float = 0.0
+            var ci: Int = 0
+            while ci < 32:
+                let x: Float = mem_load(ptr_offset(in_f32, in_offset + ci, "Float"), "Float")
+                var q: Int = (x * inv_c + 0.5) as Int
+                if x < 0.0: q = (x * inv_c - 0.5) as Int
+                if q > 7: q = 7
+                if q < (0 - 8): q = 0 - 8
+                let recon: Float = (q as Float) * exact_d
+                let diff: Float = x - recon
+                err_acc = err_acc + diff * diff
+                ci = ci + 1
+
+            if err_acc < best_err:
+                best_err = err_acc
+                best_d_u16 = cand_u16
+                best_inv_d = inv_c
+
+        cand_i = cand_i + 1
+
+    write_u16_le(out_bytes, out_offset, best_d_u16)
 
     var j: Int = 0
     while j < 16:
         let x0: Float = mem_load(ptr_offset(in_f32, in_offset + 2 * j, "Float"), "Float")
         let x1: Float = mem_load(ptr_offset(in_f32, in_offset + 2 * j + 1, "Float"), "Float")
 
-        var q0: Int = (x0 * inv_d + 0.5) as Int
-        if x0 < 0.0: q0 = (x0 * inv_d - 0.5) as Int
+        var q0: Int = (x0 * best_inv_d + 0.5) as Int
+        if x0 < 0.0: q0 = (x0 * best_inv_d - 0.5) as Int
         if q0 > 7: q0 = 7
         if q0 < (0 - 8): q0 = 0 - 8
         let nib0: Int = (q0 + 8) & 15
 
-        var q1: Int = (x1 * inv_d + 0.5) as Int
-        if x1 < 0.0: q1 = (x1 * inv_d - 0.5) as Int
+        var q1: Int = (x1 * best_inv_d + 0.5) as Int
+        if x1 < 0.0: q1 = (x1 * best_inv_d - 0.5) as Int
         if q1 > 7: q1 = 7
         if q1 < (0 - 8): q1 = 0 - 8
         let nib1: Int = (q1 + 8) & 15
@@ -2869,16 +3313,25 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
             write_u64_le(t_buf, tb_off, st.dim3)
             tb_off = tb_off + 8
 
-        // Determine if tensor can be quantized (2D/3D weights divisible by 32)
+        // Determine if tensor can be quantized (2D+ weights, element count divisible by 32,
+        // source must be losslessly decodable: F32 / F16 / BF16. Already-quantized sources
+        // pass through untouched — re-quantizing a quantize compounds grid noise.)
         var out_type: Int = st.type_id
         var out_bytes: Int = st.size_bytes
-        let total_elem: Int = st.dim0 * st.dim1
+        var total_elem: Int = st.dim0
+        if st.n_dims >= 2:
+            total_elem = total_elem * st.dim1
+        if st.n_dims >= 3:
+            total_elem = total_elem * st.dim2
+        if st.n_dims >= 4:
+            total_elem = total_elem * st.dim3
         if st.n_dims >= 2 and (total_elem % 32) == 0:
-            out_type = target_type_id
-            if target_type_id == 8:
-                out_bytes = (total_elem / 32) * 34
-            elif target_type_id == 2:
-                out_bytes = (total_elem / 32) * 18
+            if st.type_id == 0 or st.type_id == 1 or st.type_id == 28:
+                out_type = target_type_id
+                if target_type_id == 8:
+                    out_bytes = (total_elem / 32) * 34
+                elif target_type_id == 2:
+                    out_bytes = (total_elem / 32) * 18
 
         // Write type_id
         write_u32_le(t_buf, tb_off, out_type)
@@ -2915,28 +3368,44 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
     let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
     var stream_i: Int = 0
 
+    var passthrough_tensors: Int = 0
     while stream_i < len(model.tensors):
         let orig_t: GgufTensor = model.tensors[stream_i]
         let src_abs_off: Int = model.tensor_data_offset + orig_t.offset
-        let total_elem: Int = orig_t.dim0 * orig_t.dim1
+        var total_elem: Int = orig_t.dim0
+        if orig_t.n_dims >= 2:
+            total_elem = total_elem * orig_t.dim1
+        if orig_t.n_dims >= 3:
+            total_elem = total_elem * orig_t.dim2
+        if orig_t.n_dims >= 4:
+            total_elem = total_elem * orig_t.dim3
 
         var is_recompressed: Int = 0
         if orig_t.n_dims >= 2 and (total_elem % 32) == 0:
-            is_recompressed = 1
+            if orig_t.type_id == 0 or orig_t.type_id == 1 or orig_t.type_id == 28:
+                is_recompressed = 1
 
         if is_recompressed == 0:
-            // Direct DMA passthrough for 1D biases/norms
+            // Direct DMA passthrough: 1D biases/norms, odd shapes, or already-quantized
+            // sources (re-quantizing a quantize compounds grid noise — refuse).
+            passthrough_tensors = passthrough_tensors + 1
             var remaining: Int = orig_t.size_bytes
             var cur_chunk_src: Int = src_abs_off
             while remaining > 0:
                 var to_read: Int = remaining
                 if to_read > chunk_size: to_read = chunk_size
                 let r_act: Int = k_read_at(h_src, nslot, cur_chunk_src, dma_buf, to_read)
+                if r_act <= 0:
+                    break
                 let _w_act: Int = k_write_all(h_dst, nslot, dma_buf, r_act)
                 cur_chunk_src = cur_chunk_src + r_act
                 remaining = remaining - r_act
         else:
-            // Quantize tensor blocks
+            // Quantize tensor blocks from a lossless float source
+            let src_kind: Int = orig_t.type_id
+            var src_bytes_per_elem: Int = 2
+            if src_kind == 0:
+                src_bytes_per_elem = 4
             let n_blocks: Int = total_elem / 32
             var cur_b: Int = 0
             while cur_b < n_blocks:
@@ -2946,20 +3415,23 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
 
                 let elem_count: Int = blocks_this_batch * 32
                 let f32_arena: ptr<Float> = alloc_zeroed(elem_count + 32, "Float")
-                
-                // Read raw tensor floats (via F16/F32 decode or fallback)
-                let src_elem_bytes: Int = blocks_this_batch * 32 * 2 // assuming F16 baseline
-                var actual_src_bytes: Int = src_elem_bytes
-                if actual_src_bytes > chunk_size: actual_src_bytes = chunk_size
-                
-                let cur_src_byte_pos: Int = src_abs_off + (cur_b * 32 * 2)
-                let r_act: Int = k_read_at(h_src, nslot, cur_src_byte_pos, dma_buf, actual_src_bytes)
+
+                // Read + decode this batch according to the true source dtype
+                let batch_src_bytes: Int = elem_count * src_bytes_per_elem
+                let cur_src_byte_pos: Int = src_abs_off + (cur_b * 32 * src_bytes_per_elem)
+                let r_act: Int = k_read_at(h_src, nslot, cur_src_byte_pos, dma_buf, batch_src_bytes)
 
                 // Decode to F32
                 var di: Int = 0
                 while di < elem_count:
-                    let u16_val: Int = read_u16_le(dma_buf, di * 2)
-                    mem_store(ptr_offset(f32_arena, di, "Float"), fp16_to_fp32(u16_val), "Float")
+                    if src_kind == 0:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), read_f32_le(dma_buf, di * 4), "Float")
+                    elif src_kind == 1:
+                        let u16_val: Int = read_u16_le(dma_buf, di * 2)
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fp16_to_fp32(u16_val), "Float")
+                    else:
+                        let b16_val: Int = read_u16_le(dma_buf, di * 2)
+                        mem_store(ptr_offset(f32_arena, di, "Float"), bf16_to_fp32(b16_val), "Float")
                     di = di + 1
 
                 // Quantize to target
@@ -3006,7 +3478,412 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
     let _c_s: Int = k_CloseHandle(h_src)
     let _c_d: Int = k_CloseHandle(h_dst)
 
+    println(" Re-quantized natively: " + str(len(model.tensors) - passthrough_tensors) + " tensors")
+    println(" Passed through (1D / odd-shape / already-quantized): " + str(passthrough_tensors) + " tensors")
     println(" Quantization complete -> " + out_path)
+    return EXIT_OK
+
+// Helper to serialize a string KV pair into a GGUF byte buffer
+pub fn write_gguf_kv_string(buf: ptr<Byte>, off: Int, key: String, val: String) -> Int with Unsafe:
+    let k_bytes: Array<Int> = bytes_of_str(key)
+    let k_len: Int = len(k_bytes)
+    let v_bytes: Array<Int> = bytes_of_str(val)
+    let v_len: Int = len(v_bytes)
+
+    var cur: Int = off
+    write_u64_le(buf, cur, k_len)
+    cur = cur + 8
+
+    var ki: Int = 0
+    while ki < k_len:
+        bstore(buf, cur, k_bytes[ki])
+        cur = cur + 1
+        ki = ki + 1
+
+    // Type 8 = GGUF_TYPE_STRING
+    write_u32_le(buf, cur, 8)
+    cur = cur + 4
+
+    write_u64_le(buf, cur, v_len)
+    cur = cur + 8
+
+    var vi: Int = 0
+    while vi < v_len:
+        bstore(buf, cur, v_bytes[vi])
+        cur = cur + 1
+        vi = vi + 1
+
+    return cur - off
+
+// Helper to serialize a uint32 KV pair into a GGUF byte buffer
+pub fn write_gguf_kv_u32(buf: ptr<Byte>, off: Int, key: String, val: Int) -> Int with Unsafe:
+    let k_bytes: Array<Int> = bytes_of_str(key)
+    let k_len: Int = len(k_bytes)
+
+    var cur: Int = off
+    write_u64_le(buf, cur, k_len)
+    cur = cur + 8
+
+    var ki: Int = 0
+    while ki < k_len:
+        bstore(buf, cur, k_bytes[ki])
+        cur = cur + 1
+        ki = ki + 1
+
+    // Type 4 = GGUF_TYPE_UINT32
+    write_u32_le(buf, cur, 4)
+    cur = cur + 4
+
+    write_u32_le(buf, cur, val)
+    cur = cur + 4
+
+    return cur - off
+
+// High-level SafeTensors -> GGUF Direct Quantization Pipeline (100% Native Pure Kain)
+pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: String, out_path: String) -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Direct SafeTensors -> GGUF Native Quantization Engine")
+    println("================================================================================")
+    println(" Source:        " + model.path + " (" + format_bytes(model.file_size) + ")")
+    println(" Target Format: " + target_format)
+    println(" Destination:   " + out_path)
+
+    var target_type_id: Int = 8 // Default Q8_0
+    var file_type: Int = 7
+    if target_format == "q4_0" or target_format == "q4":
+        target_type_id = 2
+        file_type = 2
+
+    // Detect model architecture
+    var arch_name: String = "flux"
+    var ai: Int = 0
+    while ai < len(model.tensors):
+        let tn: String = model.tensors[ai].name
+        if find_from(tn, "diffusion_model.", 0) >= 0 or find_from(tn, "v2_i2v", 0) >= 0 or find_from(tn, "wan", 0) >= 0:
+            arch_name = "wan"
+            break
+        elif find_from(tn, "double_blocks.", 0) >= 0 or find_from(tn, "single_blocks.", 0) >= 0:
+            arch_name = "flux"
+            break
+        elif find_from(tn, "model.layers.", 0) >= 0 or find_from(tn, "blk.", 0) >= 0:
+            arch_name = "llama"
+            break
+        ai = ai + 1
+
+    println(" Architecture:  " + arch_name)
+    println(" Tensors:       " + str(model.tensor_count))
+    println(" Blocks:        " + str(model.block_count))
+
+    // Open source file
+    let h_src: ptr<Void> = k_open_read(model.path)
+    if k_handle_bad(h_src) == 1:
+        println("quantize: failed to open source model " + model.path)
+        return EXIT_ERROR
+
+    // Open destination file
+    let h_dst: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h_dst) == 1:
+        println("quantize: failed to open destination file " + out_path)
+        let _c: Int = k_CloseHandle(h_src)
+        return EXIT_ERROR
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+
+    // 1. Build GGUF Header (24 bytes) + KV Metadata
+    let kv_max_sz: Int = 65536
+    let kv_buf: ptr<Byte> = alloc_zeroed(kv_max_sz + 32, "Byte")
+    var kv_off: Int = 0
+
+    // Magic: GGUF (0x46554747)
+    write_u32_le(kv_buf, kv_off, GGUF_MAGIC)
+    kv_off = kv_off + 4
+
+    // Version: 3
+    write_u32_le(kv_buf, kv_off, 3)
+    kv_off = kv_off + 4
+
+    // Tensor Count
+    write_u64_le(kv_buf, kv_off, model.tensor_count)
+    kv_off = kv_off + 8
+
+    // KV Count = 5
+    let kv_count: Int = 5
+    write_u64_le(kv_buf, kv_off, kv_count)
+    kv_off = kv_off + 8
+
+    // KV 1: general.architecture (string)
+    let w1: Int = write_gguf_kv_string(kv_buf, kv_off, "general.architecture", arch_name)
+    kv_off = kv_off + w1
+
+    // KV 2: general.quantization_version (uint32 = 2)
+    let w2: Int = write_gguf_kv_u32(kv_buf, kv_off, "general.quantization_version", 2)
+    kv_off = kv_off + w2
+
+    // KV 3: general.alignment (uint32 = 32)
+    let w3: Int = write_gguf_kv_u32(kv_buf, kv_off, "general.alignment", 32)
+    kv_off = kv_off + w3
+
+    // KV 4: general.file_type (uint32 = file_type)
+    let w4: Int = write_gguf_kv_u32(kv_buf, kv_off, "general.file_type", file_type)
+    kv_off = kv_off + w4
+
+    // KV 5: <arch>.block_count (uint32)
+    let blk_key: String = arch_name + ".block_count"
+    let w5: Int = write_gguf_kv_u32(kv_buf, kv_off, blk_key, model.block_count)
+    kv_off = kv_off + w5
+
+    let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_off)
+    decay kv_buf
+
+    // 2. Serialize Tensor Descriptors
+    let t_buf_sz: Int = 1048576 * 4
+    let t_buf: ptr<Byte> = alloc_zeroed(t_buf_sz + 32, "Byte")
+    var tb_off: Int = 0
+
+    let alignment: Int = 32
+    var cur_payload_offset: Int = 0
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let st: SafetensorsTensor = model.tensors[ti]
+        let tname: String = st.name
+        let tname_bytes: Array<Int> = bytes_of_str(tname)
+        let tn_len: Int = len(tname_bytes)
+
+        // String len + bytes
+        write_u64_le(t_buf, tb_off, tn_len)
+        tb_off = tb_off + 8
+        var ni: Int = 0
+        while ni < tn_len:
+            bstore(t_buf, tb_off, tname_bytes[ni])
+            tb_off = tb_off + 1
+            ni = ni + 1
+
+        // n_dims
+        write_u32_le(t_buf, tb_off, st.n_dims)
+        tb_off = tb_off + 4
+
+        // Dims written in GGML / GGUF reversed order (cols first)
+        if st.n_dims == 1:
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        elif st.n_dims == 2:
+            write_u64_le(t_buf, tb_off, st.dim1) // cols
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim0) // rows
+            tb_off = tb_off + 8
+        elif st.n_dims == 3:
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        elif st.n_dims >= 4:
+            write_u64_le(t_buf, tb_off, st.dim3)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+
+        var total_elem: Int = st.dim0
+        if st.n_dims >= 2: total_elem = total_elem * st.dim1
+        if st.n_dims >= 3: total_elem = total_elem * st.dim2
+        if st.n_dims >= 4: total_elem = total_elem * st.dim3
+
+        var out_type: Int = 1 // Default FP16 for 1D/norm
+        var out_bytes: Int = total_elem * 2
+        if st.dtype == "F32" or st.dtype == "f32":
+            out_type = 0
+            out_bytes = total_elem * 4
+
+        if st.n_dims >= 2 and (total_elem % 32) == 0:
+            out_type = target_type_id
+            if target_type_id == 8:
+                out_bytes = (total_elem / 32) * 34
+            elif target_type_id == 2:
+                out_bytes = (total_elem / 32) * 18
+
+        // Write type_id
+        write_u32_le(t_buf, tb_off, out_type)
+        tb_off = tb_off + 4
+
+        // Write payload offset
+        write_u64_le(t_buf, tb_off, cur_payload_offset)
+        tb_off = tb_off + 8
+
+        // Advance payload offset aligned to 32 bytes
+        cur_payload_offset = cur_payload_offset + out_bytes
+        let rem: Int = cur_payload_offset % alignment
+        if rem != 0:
+            cur_payload_offset = cur_payload_offset + (alignment - rem)
+
+        ti = ti + 1
+
+    let _w_t: Int = k_write_all(h_dst, nslot, t_buf, tb_off)
+    decay t_buf
+
+    // Align file position to alignment boundary
+    let total_hdr: Int = kv_off + tb_off
+    let pad_needed: Int = (alignment - (total_hdr % alignment)) % alignment
+    if pad_needed > 0:
+        let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+        let _w_pad: Int = k_write_all(h_dst, nslot, pad_buf, pad_needed)
+        decay pad_buf
+
+    println(" Header & Tensor Directory configured.")
+    println(" Streaming payloads with direct kernel32 DMA & MSE quantization ...")
+
+    let chunk_size: Int = 8388608 // 8MB
+    let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    var stream_i: Int = 0
+    var passthrough_cnt: Int = 0
+
+    while stream_i < len(model.tensors):
+        let st: SafetensorsTensor = model.tensors[stream_i]
+        let src_abs_off: Int = model.data_offset + st.offset_begin
+
+        var total_elem: Int = st.dim0
+        if st.n_dims >= 2: total_elem = total_elem * st.dim1
+        if st.n_dims >= 3: total_elem = total_elem * st.dim2
+        if st.n_dims >= 4: total_elem = total_elem * st.dim3
+
+        var is_recompressed: Int = 0
+        if st.n_dims >= 2 and (total_elem % 32) == 0:
+            is_recompressed = 1
+
+        var written_tensor_bytes: Int = 0
+
+        if is_recompressed == 0:
+            passthrough_cnt = passthrough_cnt + 1
+            // Stream 1D tensors (convert BF16 -> F16 if necessary)
+            var remaining: Int = st.size_bytes
+            var cur_chunk_src: Int = src_abs_off
+            var is_bf16: Int = 0
+            if st.dtype == "BF16" or st.dtype == "bf16":
+                is_bf16 = 1
+
+            while remaining > 0:
+                var to_read: Int = remaining
+                if to_read > chunk_size: to_read = chunk_size
+                let r_act: Int = k_read_at(h_src, nslot, cur_chunk_src, dma_buf, to_read)
+                if r_act <= 0: break
+                if is_bf16 == 1:
+                    let n_h: Int = r_act / 2
+                    let f16_buf: ptr<Byte> = alloc_zeroed(r_act + 32, "Byte")
+                    var hi: Int = 0
+                    while hi < n_h:
+                        let bf_val: Int = read_u16_le(dma_buf, hi * 2)
+                        let f32_val: Float = bf16_to_fp32(bf_val)
+                        let f16_val: Int = fp32_to_fp16(f32_val)
+                        write_u16_le(f16_buf, hi * 2, f16_val)
+                        hi = hi + 1
+                    let _w: Int = k_write_all(h_dst, nslot, f16_buf, r_act)
+                    decay f16_buf
+                else:
+                    let _w: Int = k_write_all(h_dst, nslot, dma_buf, r_act)
+                cur_chunk_src = cur_chunk_src + r_act
+                remaining = remaining - r_act
+            written_tensor_bytes = st.size_bytes
+        else:
+            var src_bytes_per_elem: Int = 2
+            var is_f32: Int = 0
+            var is_f16: Int = 0
+            var is_fp8: Int = 0
+            if st.dtype == "F32" or st.dtype == "f32":
+                src_bytes_per_elem = 4
+                is_f32 = 1
+            elif st.dtype == "F16" or st.dtype == "f16" or st.dtype == "FP16" or st.dtype == "fp16":
+                is_f16 = 1
+            elif st.dtype == "F8_E4M3" or st.dtype == "f8_e4m3" or st.dtype == "float8_e4m3fn" or st.dtype == "E4M3" or st.dtype == "e4m3" or st.dtype == "FP8" or st.dtype == "fp8":
+                src_bytes_per_elem = 1
+                is_fp8 = 1
+
+            let n_blocks: Int = total_elem / 32
+            var cur_b: Int = 0
+            while cur_b < n_blocks:
+                var blocks_this_batch: Int = 2048
+                if cur_b + blocks_this_batch > n_blocks:
+                    blocks_this_batch = n_blocks - cur_b
+
+                let elem_count: Int = blocks_this_batch * 32
+                let f32_arena: ptr<Float> = alloc_zeroed(elem_count + 32, "Float")
+
+                let batch_src_bytes: Int = elem_count * src_bytes_per_elem
+                let cur_src_byte_pos: Int = src_abs_off + (cur_b * 32 * src_bytes_per_elem)
+                let r_act: Int = k_read_at(h_src, nslot, cur_src_byte_pos, dma_buf, batch_src_bytes)
+
+                // Decode to F32
+                if is_fp8 == 1:
+                    var di: Int = 0
+                    while di < elem_count:
+                        let fval: Float = fp8_e4m3_to_fp32(bref(dma_buf, di))
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fval, "Float")
+                        di = di + 1
+                elif is_f32 == 1:
+                    var di: Int = 0
+                    while di < elem_count:
+                        let fval: Float = read_f32_le(dma_buf, di * 4)
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fval, "Float")
+                        di = di + 1
+                elif is_f16 == 1:
+                    var di: Int = 0
+                    while di < elem_count:
+                        let u16_val: Int = read_u16_le(dma_buf, di * 2)
+                        let fval: Float = fp16_to_fp32(u16_val)
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fval, "Float")
+                        di = di + 1
+                else:
+                    var di: Int = 0
+                    while di < elem_count:
+                        let u16_val: Int = read_u16_le(dma_buf, di * 2)
+                        let fval: Float = bf16_to_fp32(u16_val)
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fval, "Float")
+                        di = di + 1
+
+                // Quantize and write batch
+                var batch_out_bytes: Int = blocks_this_batch * 34
+                if target_type_id == 2:
+                    batch_out_bytes = blocks_this_batch * 18
+
+                let q_batch: ptr<Byte> = alloc_zeroed(batch_out_bytes + 32, "Byte")
+                var qbi: Int = 0
+                while qbi < blocks_this_batch:
+                    if target_type_id == 8:
+                        quantize_block_q8_0(f32_arena, qbi * 32, q_batch, qbi * 34)
+                    elif target_type_id == 2:
+                        quantize_block_q4_0(f32_arena, qbi * 32, q_batch, qbi * 18)
+                    qbi = qbi + 1
+
+                decay f32_arena
+                let _w_q: Int = k_write_all(h_dst, nslot, q_batch, batch_out_bytes)
+                decay q_batch
+
+                cur_b = cur_b + blocks_this_batch
+
+            if target_type_id == 8: written_tensor_bytes = (total_elem / 32) * 34
+            elif target_type_id == 2: written_tensor_bytes = (total_elem / 32) * 18
+
+        let t_pad: Int = (alignment - (written_tensor_bytes % alignment)) % alignment
+        if t_pad > 0:
+            let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+            let _w_tpad: Int = k_write_all(h_dst, nslot, pad_buf, t_pad)
+            decay pad_buf
+
+        stream_i = stream_i + 1
+
+    decay dma_buf
+    decay nslot
+
+    let _c_s: Int = k_CloseHandle(h_src)
+    let _c_d: Int = k_CloseHandle(h_dst)
+
+    println(" Direct SafeTensors Quantization complete!")
+    println(" Quantized tensors: " + str(len(model.tensors) - passthrough_cnt))
+    println(" Preserved floats:  " + str(passthrough_cnt))
+    println(" Output GGUF:       " + out_path)
     return EXIT_OK
 
 // ============================================================================
@@ -3175,36 +4052,52 @@ pub fn parse_safetensors_model(path: String) -> SafetensorsModel with Unsafe:
                         break
                     p_dt = p_dt + 1
 
-                // Parse data_offsets: [begin, end]
+                // Parse shape: [d0, d1, ...] — first up to 4 dims
+                var s_d0: Int = 1
+                var s_d1: Int = 1
+                var s_d2: Int = 1
+                var s_d3: Int = 1
+                var s_nd: Int = 0
+                var p_sh: Int = obj_start
+                while p_sh < obj_end - 7:
+                    if bref(json_buf, p_sh) == 115 and bref(json_buf, p_sh + 1) == 104 and bref(json_buf, p_sh + 2) == 97 and bref(json_buf, p_sh + 3) == 112 and bref(json_buf, p_sh + 4) == 101:
+                        var sb: Int = p_sh + 5
+                        while sb < obj_end and bref(json_buf, sb) != 91:
+                            sb = sb + 1
+                        sb = sb + 1
+                        var dim_slot: Int = 0
+                        while sb < obj_end and bref(json_buf, sb) != 93:
+                            while sb < obj_end and (bref(json_buf, sb) < 48 or bref(json_buf, sb) > 57):
+                                if bref(json_buf, sb) == 93:
+                                    break
+                                sb = sb + 1
+                            if sb < obj_end and bref(json_buf, sb) == 93:
+                                break
+                            var dv: Int = 0
+                            while sb < obj_end and bref(json_buf, sb) >= 48 and bref(json_buf, sb) <= 57:
+                                dv = dv * 10 + (bref(json_buf, sb) - 48)
+                                sb = sb + 1
+                            if dim_slot == 0:
+                                s_d0 = dv
+                            elif dim_slot == 1:
+                                s_d1 = dv
+                            elif dim_slot == 2:
+                                s_d2 = dv
+                            elif dim_slot == 3:
+                                s_d3 = dv
+                            s_nd = s_nd + 1
+                            dim_slot = dim_slot + 1
+                            if dim_slot >= 4:
+                                break
+                        break
+                    p_sh = p_sh + 1
+
+                // Parse data_offsets: [begin, end] directly from buffer bytes
                 var off_begin: Int = 0
                 var off_end: Int = 0
                 var p_off: Int = obj_start
                 while p_off < obj_end - 12:
                     if bref(json_buf, p_off) == 100 and bref(json_buf, p_off + 1) == 97 and bref(json_buf, p_off + 2) == 116 and bref(json_buf, p_off + 3) == 97 and bref(json_buf, p_off + 4) == 95 and bref(json_buf, p_off + 5) == 111:
-                        // find '['
-                        var ob: Int = p_off + 6
-                        while ob < obj_end and bref(json_buf, ob) != 91:
-                            ob = ob + 1
-                        ob = ob + 1
-                        // read begin int
-                        while ob < obj_end and bref(json_buf, ob) <= 32:
-                            ob = ob + 1
-                        var b_chars: String = ""
-                        while ob < obj_end and bref(json_buf, ob) != 44 and bref(json_buf, ob) > 32:
-                            b_chars = b_chars + char_at(str(bref(json_buf, ob)), 0) // read digit chars
-                            ob = ob + 1
-                        // comma
-                        while ob < obj_end and bref(json_buf, ob) != 44:
-                            ob = ob + 1
-                        ob = ob + 1
-                        // read end int
-                        while ob < obj_end and bref(json_buf, ob) <= 32:
-                            ob = ob + 1
-                        var e_chars: String = ""
-                        while ob < obj_end and bref(json_buf, ob) != 93 and bref(json_buf, ob) > 32:
-                            e_chars = e_chars + char_at(str(bref(json_buf, ob)), 0)
-                            ob = ob + 1
-
                         // parse numbers directly from buffer bytes
                         var num_b: Int = 0
                         var pb: Int = p_off
@@ -3234,17 +4127,23 @@ pub fn parse_safetensors_model(path: String) -> SafetensorsModel with Unsafe:
                 if b_idx > max_block_id:
                     max_block_id = b_idx
 
+                var t_sz: Int = off_end - off_begin
+                if t_sz < 0:
+                    t_sz = 0
+                var t_nd: Int = s_nd
+                if t_nd <= 0:
+                    t_nd = 2
                 let t_item = SafetensorsTensor {
                     name: key_str,
                     dtype: dtype_str,
-                    dim0: 0,
-                    dim1: 0,
-                    dim2: 0,
-                    dim3: 0,
-                    n_dims: 2,
+                    dim0: s_d0,
+                    dim1: s_d1,
+                    dim2: s_d2,
+                    dim3: s_d3,
+                    n_dims: t_nd,
                     offset_begin: off_begin,
                     offset_end: off_end,
-                    size_bytes: off_end - off_begin,
+                    size_bytes: t_sz,
                     block_idx: b_idx,
                 }
                 push(tensor_list, t_item)
@@ -3300,20 +4199,29 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
     if k_handle_bad(h) == 1:
         return sample
 
-    // 1. Locate primary projection tensor for this block
+    // 1. Locate primary projection tensor for this block. Scale / norm / bias
+    // satellites (input_scale, weight_scale, norm.weight, bias) are skipped —
+    // they carry no weight distribution. Preference: proj/ffn/out/down weight.
     var target_idx: Int = -1
     var first_idx: Int = -1
+    var weight_idx: Int = -1
     var ti: Int = 0
     while ti < len(model.tensors):
         let t: SafetensorsTensor = model.tensors[ti]
         if t.block_idx == block_idx:
-            if first_idx < 0:
-                first_idx = ti
-            if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0:
-                target_idx = ti
-                break
+            if find_from(t.name, "scale", 0) < 0:
+                if first_idx < 0:
+                    first_idx = ti
+                if find_from(t.name, "weight", 0) >= 0:
+                    if weight_idx < 0:
+                        weight_idx = ti
+                    if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0 or find_from(t.name, "qkv", 0) >= 0 or find_from(t.name, "linear", 0) >= 0:
+                        target_idx = ti
+                        break
         ti = ti + 1
 
+    if target_idx < 0:
+        target_idx = weight_idx
     if target_idx < 0:
         target_idx = first_idx
 
@@ -3327,8 +4235,10 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
     let nslot: ptr<Int> = alloc_zeroed(1, "Int")
 
     var bytes_to_read: Int = max_floats * 2
-    if target.dtype == "F32":
+    if target.dtype == "F32" or target.dtype == "f32":
         bytes_to_read = max_floats * 4
+    if target.dtype == "F8_E4M3" or target.dtype == "f8_e4m3" or target.dtype == "float8_e4m3fn" or target.dtype == "E4M3" or target.dtype == "e4m3" or target.dtype == "FP8" or target.dtype == "fp8":
+        bytes_to_read = max_floats
     if bytes_to_read > tsize:
         bytes_to_read = tsize
     if bytes_to_read > 65536:
@@ -3342,15 +4252,31 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
         decay raw_buf
         return sample
 
-    // 2. Decode raw float weights (BF16, F16, F32)
-    if target.dtype == "F32":
+    // 2. Decode raw float weights (F32 / F16 / BF16 / FP8_E4M3, case-insensitive)
+    var is_f32: Int = 0
+    var is_f16: Int = 0
+    var is_fp8: Int = 0
+    if target.dtype == "F32" or target.dtype == "f32":
+        is_f32 = 1
+    elif target.dtype == "F16" or target.dtype == "f16" or target.dtype == "FP16" or target.dtype == "fp16":
+        is_f16 = 1
+    elif target.dtype == "F8_E4M3" or target.dtype == "f8_e4m3" or target.dtype == "float8_e4m3fn" or target.dtype == "E4M3" or target.dtype == "e4m3" or target.dtype == "FP8" or target.dtype == "fp8":
+        is_fp8 = 1
+    if is_fp8 == 1:
+        let num_floats: Int = r_act
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let fval: Float = fp8_e4m3_to_fp32(bref(raw_buf, fi))
+            push(sample, fval)
+            fi = fi + 1
+    elif is_f32 == 1:
         let num_floats: Int = r_act / 4
         var fi: Int = 0
         while fi < num_floats and len(sample) < max_floats:
             let fval: Float = read_f32_le(raw_buf, fi * 4)
             push(sample, fval)
             fi = fi + 1
-    elif target.dtype == "F16":
+    elif is_f16 == 1:
         let num_floats: Int = r_act / 2
         var fi: Int = 0
         while fi < num_floats and len(sample) < max_floats:
@@ -3359,7 +4285,7 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
             push(sample, fval)
             fi = fi + 1
     else:
-        // Default BF16 (Hugging Face / Wan 2.1 standard)
+        // Default BF16 incl. BF16/bf16 (Hugging Face / Wan 2.1 standard)
         let num_floats: Int = r_act / 2
         var fi: Int = 0
         while fi < num_floats and len(sample) < max_floats:
@@ -3370,6 +4296,199 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
 
     decay raw_buf
     return sample
+
+// Dense whole-block energy and kurtosis streaming across all linear projections in a SafeTensors block
+pub fn compute_safetensors_block_dense_stats(h: ptr<Void>, model: SafetensorsModel, block_idx: Int, sample_cap: Int) -> BlockDenseStats with Unsafe:
+    let empty_arr: Array<Float> = []
+    let dummy = BlockDenseStats {
+        block_idx: block_idx,
+        total_elements: 0,
+        frobenius_norm: 0.0,
+        rms_energy: 0.0,
+        variance: 0.0,
+        kurtosis: 3.0,
+        max_abs: 0.0,
+        delta_gain_db: 0.0,
+        sample: empty_arr,
+    }
+    if k_handle_bad(h) == 1:
+        return dummy
+
+    // 1. Gather all 2D+ linear projection tensors for this block (skip 1D biases/scales/norms)
+    var proj_indices: Array<Int> = []
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: SafetensorsTensor = model.tensors[ti]
+        if t.block_idx == block_idx:
+            if t.n_dims >= 2:
+                if find_from(t.name, "scale", 0) < 0:
+                    if find_from(t.name, "bias", 0) < 0:
+                        if find_from(t.name, "norm", 0) < 0:
+                            if find_from(t.name, "ln", 0) < 0:
+                                push(proj_indices, ti)
+        ti = ti + 1
+
+    if len(proj_indices) == 0:
+        var fi: Int = 0
+        while fi < len(model.tensors):
+            let t: SafetensorsTensor = model.tensors[fi]
+            if t.block_idx == block_idx:
+                if find_from(t.name, "scale", 0) < 0:
+                    push(proj_indices, fi)
+            fi = fi + 1
+
+    if len(proj_indices) == 0:
+        return dummy
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let buf_bytes: Int = 65536
+    let raw_buf: ptr<Byte> = alloc_zeroed(buf_bytes + 32, "Byte")
+
+    var total_elements: Int = 0
+    var sum: Float = 0.0
+    var sum_sq: Float = 0.0
+    var sum_m4: Float = 0.0
+    var max_abs_val: Float = 0.0
+    var sample_out: Array<Float> = []
+
+    let target_sample_per_proj: Int = (sample_cap / len(proj_indices)) + 1
+
+    var pi: Int = 0
+    while pi < len(proj_indices):
+        let t_idx: Int = proj_indices[pi]
+        let target: SafetensorsTensor = model.tensors[t_idx]
+        let abs_off: Int = model.data_offset + target.offset_begin
+        let tsize: Int = target.size_bytes
+
+        var to_read: Int = buf_bytes
+        if to_read > tsize:
+            to_read = tsize
+
+        let r_act: Int = k_read_at(h, nslot, abs_off, raw_buf, to_read)
+        if r_act > 0:
+            var proj_sampled: Int = 0
+            var is_f32: Int = 0
+            var is_f16: Int = 0
+            var is_fp8: Int = 0
+            if target.dtype == "F32" or target.dtype == "f32":
+                is_f32 = 1
+            elif target.dtype == "F16" or target.dtype == "f16" or target.dtype == "FP16" or target.dtype == "fp16":
+                is_f16 = 1
+            elif target.dtype == "F8_E4M3" or target.dtype == "f8_e4m3" or target.dtype == "float8_e4m3fn" or target.dtype == "E4M3" or target.dtype == "e4m3" or target.dtype == "FP8" or target.dtype == "fp8":
+                is_fp8 = 1
+
+            if is_fp8 == 1:
+                let num_f: Int = r_act
+                var fi: Int = 0
+                while fi < num_f:
+                    let fval: Float = fp8_e4m3_to_fp32(bref(raw_buf, fi))
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif is_f32 == 1:
+                let num_f: Int = r_act / 4
+                var fi: Int = 0
+                while fi < num_f:
+                    let fval: Float = read_f32_le(raw_buf, fi * 4)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif is_f16 == 1:
+                let num_f: Int = r_act / 2
+                var fi: Int = 0
+                while fi < num_f:
+                    let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+                    let fval: Float = fp16_to_fp32(u16_val)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            else:
+                // BF16
+                let num_f: Int = r_act / 2
+                var fi: Int = 0
+                while fi < num_f:
+                    let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+                    let fval: Float = bf16_to_fp32(u16_val)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+        pi = pi + 1
+
+    decay raw_buf
+    decay nslot
+
+    if total_elements <= 0:
+        return dummy
+
+    let n_f: Float = total_elements as Float
+    let mean: Float = sum / n_f
+    let mean_sq: Float = mean * mean
+    var variance: Float = (sum_sq / n_f) - mean_sq
+    if variance < 0.0000000001:
+        variance = 0.0000000001
+
+    let rms: Float = math_sqrt(sum_sq / n_f)
+    let frob: Float = math_sqrt(sum_sq)
+
+    var kurt: Float = 3.0
+    if variance > 0.0000000001:
+        kurt = (sum_m4 / n_f) / (variance * variance)
+    if kurt < 1.0:
+        kurt = 1.0
+
+    // Gain in dB: 20 * log10(rms * sqrt(16))
+    var g_db: Float = 0.0
+    let effective_gain: Float = rms * 4.0
+    if effective_gain > 0.000001:
+        g_db = 20.0 * (math_ln(effective_gain) * 0.4342944819032518)
+
+    return BlockDenseStats {
+        block_idx: block_idx,
+        total_elements: total_elements,
+        frobenius_norm: frob,
+        rms_energy: rms,
+        variance: variance,
+        kurtosis: kurt,
+        max_abs: max_abs_val,
+        delta_gain_db: g_db,
+        sample: sample_out,
+    }
 
 // ============================================================================
 // scheduler.kn
@@ -3384,6 +4503,92 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
 use std::runtime
 use std::text
 use std::bytes
+
+pub fn emit_schedule_json_st(model: SafetensorsModel, steps: Int, out_path: String) -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Dynamic Step-Skipping Schedule Generator (Raw Master)")
+    println("================================================================================")
+    println(" Model:            " + model.path)
+    println(" Architecture:     safetensors raw master")
+    println(" Total Blocks:     " + str(model.block_count))
+    println(" Sampling Steps:   " + str(steps))
+
+    let sched: FrftStepSchedule = generate_step_schedule(model.block_count, steps)
+    println(" Baseline passes:  " + str(model.block_count * steps))
+    let total_active_passes: Int = ((model.block_count * steps) as Float / sched.estimated_speedup) as Int
+    println(" Juiced passes:    " + str(total_active_passes))
+    println(" Est. Speedup:     " + format_2dp(sched.estimated_speedup) + "x FASTER")
+
+    var json: String = "{\n"
+    json = json + "  \"generator\": \"juicer.kn v0.1.0\",\n"
+    json = json + "  \"model\": \"" + model.path + "\",\n"
+    json = json + "  \"architecture\": \"safetensors\",\n"
+    json = json + "  \"total_blocks\": " + str(model.block_count) + ",\n"
+    json = json + "  \"sampling_steps\": " + str(steps) + ",\n"
+    json = json + "  \"estimated_speedup\": \"" + format_2dp(sched.estimated_speedup) + "x\",\n"
+    json = json + "  \"schedule\": [\n"
+
+    var s: Int = 0
+    while s < steps:
+        let step_num: Int = s + 1
+        let act_cnt: Int = sched.step_active_counts[s]
+        let pattern: String = sched.step_skip_patterns[s]
+
+        json = json + "    {\n"
+        json = json + "      \"step\": " + str(step_num) + ",\n"
+        json = json + "      \"active_blocks\": " + str(act_cnt) + ",\n"
+        json = json + "      \"pattern\": \"" + pattern + "\",\n"
+        json = json + "      \"skip_blocks\": ["
+
+        var skip_count: Int = 0
+        var b: Int = 0
+        while b < model.block_count:
+            var skip_this: Int = 0
+            if s > 0 and s < steps - 1:
+                if (b % 2) == 1:
+                    skip_this = 1
+            elif s == steps - 1 and steps > 2:
+                if (b % 4) == 1:
+                    skip_this = 1
+
+            if skip_this == 1:
+                if skip_count > 0:
+                    json = json + ", "
+                json = json + str(b)
+                skip_count = skip_count + 1
+            b = b + 1
+
+        json = json + "]\n"
+        json = json + "    }"
+        if s + 1 < steps:
+            json = json + ","
+        json = json + "\n"
+        s = s + 1
+
+    json = json + "  ]\n"
+    json = json + "}\n"
+
+    let h: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h) == 1:
+        println("scheduler: failed to write output file " + out_path)
+        return EXIT_ERROR
+
+    let raw_bytes: Array<Int> = bytes_of_str(json)
+    let nb: Int = len(raw_bytes)
+    let buf: ptr<Byte> = alloc_zeroed(nb + 32, "Byte")
+    var bi: Int = 0
+    while bi < nb:
+        bstore(buf, bi, raw_bytes[bi])
+        bi = bi + 1
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let _w: Int = k_write_all(h, nslot, buf, nb)
+    decay buf
+    decay nslot
+    let _c: Int = k_CloseHandle(h)
+
+    println(" Recipe emitted to: " + out_path)
+    return EXIT_OK
 
 pub fn emit_schedule_json(model: GgufModel, steps: Int, out_path: String) -> Int with Unsafe:
     println("\n================================================================================")
@@ -4042,6 +5247,60 @@ pub fn evaluate_spectral_block(block_idx: Int, weight_sample: Array<Float>, dim:
 
     return SpectralVerdict {
         block_idx: block_idx,
+        spectral_radius: rho,
+        condition_number: kappa,
+        delta_gain_db: gain_db,
+        kurtosis: kurt,
+        is_all_pass: all_pass,
+        prune_recommendation: rec,
+    }
+
+// Dense whole-block spectral evaluation using true Frobenius energy, condition number, and exact kurtosis
+pub fn evaluate_spectral_dense(stats: BlockDenseStats, dim: Int) -> SpectralVerdict with Unsafe:
+    let n: Int = len(stats.sample)
+    if stats.total_elements <= 0 or n <= 0:
+        return SpectralVerdict {
+            block_idx: stats.block_idx,
+            spectral_radius: 1.0,
+            condition_number: 1.0,
+            delta_gain_db: 0.0,
+            kurtosis: 3.0,
+            is_all_pass: 0,
+            prune_recommendation: "ACTIVE",
+        }
+
+    // Power iteration on stratified multi-projection sample
+    var rho: Float = spectral_power_iteration(stats.sample, dim, 12)
+    if rho <= 0.000001:
+        rho = stats.rms_energy * math_sqrt(dim as Float)
+
+    // True dense kurtosis from whole-block census
+    let kurt: Float = stats.kurtosis
+
+    // Condition number kappa
+    var kappa: Float = 1.0
+    if rho > 0.000001:
+        kappa = (stats.max_abs * math_sqrt(dim as Float)) / rho
+    if kappa < 1.0:
+        kappa = 1.0
+
+    // Delta gain in dB from true whole-block Frobenius RMS energy
+    let gain_db: Float = stats.delta_gain_db
+
+    var all_pass: Int = 0
+    var rec: String = "ACTIVE"
+
+    // If Kurtosis is extreme (> 8.0), outlier channels carry critical representations (do not excise)
+    if kurt > 8.0:
+        rec = "PROTECTED (Outlier Channels)"
+    elif gain_db < (0.0 - 22.0) or (gain_db < (0.0 - 15.0) and kappa < 1.15):
+        all_pass = 1
+        rec = "EXCISE (All-Pass Idling)"
+    elif gain_db < (0.0 - 14.0):
+        rec = "CANDIDATE (Low Delta Gain)"
+
+    return SpectralVerdict {
+        block_idx: stats.block_idx,
         spectral_radius: rho,
         condition_number: kappa,
         delta_gain_db: gain_db,

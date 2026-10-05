@@ -236,17 +236,23 @@ pub fn parse_safetensors_model(path: String) -> SafetensorsModel with Unsafe:
                 if b_idx > max_block_id:
                     max_block_id = b_idx
 
+                var t_sz: Int = off_end - off_begin
+                if t_sz < 0:
+                    t_sz = 0
+                var t_nd: Int = s_nd
+                if t_nd <= 0:
+                    t_nd = 2
                 let t_item = SafetensorsTensor {
                     name: key_str,
                     dtype: dtype_str,
-                    dim0: 0,
-                    dim1: 0,
-                    dim2: 0,
-                    dim3: 0,
-                    n_dims: 2,
+                    dim0: s_d0,
+                    dim1: s_d1,
+                    dim2: s_d2,
+                    dim3: s_d3,
+                    n_dims: t_nd,
                     offset_begin: off_begin,
                     offset_end: off_end,
-                    size_bytes: off_end - off_begin,
+                    size_bytes: t_sz,
                     block_idx: b_idx,
                 }
                 push(tensor_list, t_item)
@@ -302,20 +308,29 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
     if k_handle_bad(h) == 1:
         return sample
 
-    // 1. Locate primary projection tensor for this block
+    // 1. Locate primary projection tensor for this block. Scale / norm / bias
+    // satellites (input_scale, weight_scale, norm.weight, bias) are skipped —
+    // they carry no weight distribution. Preference: proj/ffn/out/down weight.
     var target_idx: Int = -1
     var first_idx: Int = -1
+    var weight_idx: Int = -1
     var ti: Int = 0
     while ti < len(model.tensors):
         let t: SafetensorsTensor = model.tensors[ti]
         if t.block_idx == block_idx:
-            if first_idx < 0:
-                first_idx = ti
-            if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0:
-                target_idx = ti
-                break
+            if find_from(t.name, "scale", 0) < 0:
+                if first_idx < 0:
+                    first_idx = ti
+                if find_from(t.name, "weight", 0) >= 0:
+                    if weight_idx < 0:
+                        weight_idx = ti
+                    if find_from(t.name, "proj", 0) >= 0 or find_from(t.name, "ffn", 0) >= 0 or find_from(t.name, "out", 0) >= 0 or find_from(t.name, "down", 0) >= 0 or find_from(t.name, "qkv", 0) >= 0 or find_from(t.name, "linear", 0) >= 0:
+                        target_idx = ti
+                        break
         ti = ti + 1
 
+    if target_idx < 0:
+        target_idx = weight_idx
     if target_idx < 0:
         target_idx = first_idx
 
@@ -329,8 +344,10 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
     let nslot: ptr<Int> = alloc_zeroed(1, "Int")
 
     var bytes_to_read: Int = max_floats * 2
-    if target.dtype == "F32":
+    if target.dtype == "F32" or target.dtype == "f32":
         bytes_to_read = max_floats * 4
+    if target.dtype == "F8_E4M3" or target.dtype == "f8_e4m3" or target.dtype == "float8_e4m3fn" or target.dtype == "E4M3" or target.dtype == "e4m3" or target.dtype == "FP8" or target.dtype == "fp8":
+        bytes_to_read = max_floats
     if bytes_to_read > tsize:
         bytes_to_read = tsize
     if bytes_to_read > 65536:
@@ -344,15 +361,31 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
         decay raw_buf
         return sample
 
-    // 2. Decode raw float weights (BF16, F16, F32)
-    if target.dtype == "F32":
+    // 2. Decode raw float weights (F32 / F16 / BF16 / FP8_E4M3, case-insensitive)
+    var is_f32: Int = 0
+    var is_f16: Int = 0
+    var is_fp8: Int = 0
+    if target.dtype == "F32" or target.dtype == "f32":
+        is_f32 = 1
+    elif target.dtype == "F16" or target.dtype == "f16" or target.dtype == "FP16" or target.dtype == "fp16":
+        is_f16 = 1
+    elif target.dtype == "F8_E4M3" or target.dtype == "f8_e4m3" or target.dtype == "float8_e4m3fn" or target.dtype == "E4M3" or target.dtype == "e4m3" or target.dtype == "FP8" or target.dtype == "fp8":
+        is_fp8 = 1
+    if is_fp8 == 1:
+        let num_floats: Int = r_act
+        var fi: Int = 0
+        while fi < num_floats and len(sample) < max_floats:
+            let fval: Float = fp8_e4m3_to_fp32(bref(raw_buf, fi))
+            push(sample, fval)
+            fi = fi + 1
+    elif is_f32 == 1:
         let num_floats: Int = r_act / 4
         var fi: Int = 0
         while fi < num_floats and len(sample) < max_floats:
             let fval: Float = read_f32_le(raw_buf, fi * 4)
             push(sample, fval)
             fi = fi + 1
-    elif target.dtype == "F16":
+    elif is_f16 == 1:
         let num_floats: Int = r_act / 2
         var fi: Int = 0
         while fi < num_floats and len(sample) < max_floats:
@@ -361,7 +394,7 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
             push(sample, fval)
             fi = fi + 1
     else:
-        // Default BF16 (Hugging Face / Wan 2.1 standard)
+        // Default BF16 incl. BF16/bf16 (Hugging Face / Wan 2.1 standard)
         let num_floats: Int = r_act / 2
         var fi: Int = 0
         while fi < num_floats and len(sample) < max_floats:
@@ -372,3 +405,197 @@ pub fn read_safetensors_weight_sample(h: ptr<Void>, model: SafetensorsModel, blo
 
     decay raw_buf
     return sample
+
+// Dense whole-block energy and kurtosis streaming across all linear projections in a SafeTensors block
+pub fn compute_safetensors_block_dense_stats(h: ptr<Void>, model: SafetensorsModel, block_idx: Int, sample_cap: Int) -> BlockDenseStats with Unsafe:
+    let empty_arr: Array<Float> = []
+    let dummy = BlockDenseStats {
+        block_idx: block_idx,
+        total_elements: 0,
+        frobenius_norm: 0.0,
+        rms_energy: 0.0,
+        variance: 0.0,
+        kurtosis: 3.0,
+        max_abs: 0.0,
+        delta_gain_db: 0.0,
+        sample: empty_arr,
+    }
+    if k_handle_bad(h) == 1:
+        return dummy
+
+    // 1. Gather all 2D+ linear projection tensors for this block (skip 1D biases/scales/norms)
+    var proj_indices: Array<Int> = []
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: SafetensorsTensor = model.tensors[ti]
+        if t.block_idx == block_idx:
+            if t.n_dims >= 2:
+                if find_from(t.name, "scale", 0) < 0:
+                    if find_from(t.name, "bias", 0) < 0:
+                        if find_from(t.name, "norm", 0) < 0:
+                            if find_from(t.name, "ln", 0) < 0:
+                                push(proj_indices, ti)
+        ti = ti + 1
+
+    if len(proj_indices) == 0:
+        var fi: Int = 0
+        while fi < len(model.tensors):
+            let t: SafetensorsTensor = model.tensors[fi]
+            if t.block_idx == block_idx:
+                if find_from(t.name, "scale", 0) < 0:
+                    push(proj_indices, fi)
+            fi = fi + 1
+
+    if len(proj_indices) == 0:
+        return dummy
+
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let buf_bytes: Int = 65536
+    let raw_buf: ptr<Byte> = alloc_zeroed(buf_bytes + 32, "Byte")
+
+    var total_elements: Int = 0
+    var sum: Float = 0.0
+    var sum_sq: Float = 0.0
+    var sum_m4: Float = 0.0
+    var max_abs_val: Float = 0.0
+    var sample_out: Array<Float> = []
+
+    let target_sample_per_proj: Int = (sample_cap / len(proj_indices)) + 1
+
+    var pi: Int = 0
+    while pi < len(proj_indices):
+        let t_idx: Int = proj_indices[pi]
+        let target: SafetensorsTensor = model.tensors[t_idx]
+        let abs_off: Int = model.data_offset + target.offset_begin
+        let tsize: Int = target.size_bytes
+
+        var to_read: Int = buf_bytes
+        if to_read > tsize:
+            to_read = tsize
+
+        let r_act: Int = k_read_at(h, nslot, abs_off, raw_buf, to_read)
+        if r_act > 0:
+            var proj_sampled: Int = 0
+            var is_f32: Int = 0
+            var is_f16: Int = 0
+            var is_fp8: Int = 0
+            if target.dtype == "F32" or target.dtype == "f32":
+                is_f32 = 1
+            elif target.dtype == "F16" or target.dtype == "f16" or target.dtype == "FP16" or target.dtype == "fp16":
+                is_f16 = 1
+            elif target.dtype == "F8_E4M3" or target.dtype == "f8_e4m3" or target.dtype == "float8_e4m3fn" or target.dtype == "E4M3" or target.dtype == "e4m3" or target.dtype == "FP8" or target.dtype == "fp8":
+                is_fp8 = 1
+
+            if is_fp8 == 1:
+                let num_f: Int = r_act
+                var fi: Int = 0
+                while fi < num_f:
+                    let fval: Float = fp8_e4m3_to_fp32(bref(raw_buf, fi))
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif is_f32 == 1:
+                let num_f: Int = r_act / 4
+                var fi: Int = 0
+                while fi < num_f:
+                    let fval: Float = read_f32_le(raw_buf, fi * 4)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            elif is_f16 == 1:
+                let num_f: Int = r_act / 2
+                var fi: Int = 0
+                while fi < num_f:
+                    let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+                    let fval: Float = fp16_to_fp32(u16_val)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+            else:
+                // BF16
+                let num_f: Int = r_act / 2
+                var fi: Int = 0
+                while fi < num_f:
+                    let u16_val: Int = read_u16_le(raw_buf, fi * 2)
+                    let fval: Float = bf16_to_fp32(u16_val)
+                    total_elements = total_elements + 1
+                    sum = sum + fval
+                    let w2: Float = fval * fval
+                    sum_sq = sum_sq + w2
+                    sum_m4 = sum_m4 + (w2 * w2)
+                    let af: Float = math_abs(fval)
+                    if af > max_abs_val: max_abs_val = af
+                    if proj_sampled < target_sample_per_proj:
+                        if len(sample_out) < sample_cap:
+                            push(sample_out, fval)
+                            proj_sampled = proj_sampled + 1
+                    fi = fi + 1
+        pi = pi + 1
+
+    decay raw_buf
+    decay nslot
+
+    if total_elements <= 0:
+        return dummy
+
+    let n_f: Float = total_elements as Float
+    let mean: Float = sum / n_f
+    let mean_sq: Float = mean * mean
+    var variance: Float = (sum_sq / n_f) - mean_sq
+    if variance < 0.0000000001:
+        variance = 0.0000000001
+
+    let rms: Float = math_sqrt(sum_sq / n_f)
+    let frob: Float = math_sqrt(sum_sq)
+
+    var kurt: Float = 3.0
+    if variance > 0.0000000001:
+        kurt = (sum_m4 / n_f) / (variance * variance)
+    if kurt < 1.0:
+        kurt = 1.0
+
+    // Gain in dB: 20 * log10(rms * sqrt(16))
+    var g_db: Float = 0.0
+    let effective_gain: Float = rms * 4.0
+    if effective_gain > 0.000001:
+        g_db = 20.0 * (math_ln(effective_gain) * 0.4342944819032518)
+
+    return BlockDenseStats {
+        block_idx: block_idx,
+        total_elements: total_elements,
+        frobenius_norm: frob,
+        rms_energy: rms,
+        variance: variance,
+        kurtosis: kurt,
+        max_abs: max_abs_val,
+        delta_gain_db: g_db,
+        sample: sample_out,
+    }
+

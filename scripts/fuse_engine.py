@@ -92,13 +92,19 @@ def quantize_q4_k_gpu(w: torch.Tensor) -> torch.Tensor:
     return block_bytes
 
 def get_block_id(name: str) -> int:
+    # NOTE: single_blocks.<i> maps to 1000+i to match the Kain-side convention
+    # (slicer.kn / gguf_parser.kn), so --drop ids mean the same thing in
+    # `jc slice` and `jc fuse`. All other prefixes use their raw index.
     for prefix in ("blocks.", "double_blocks.", "single_blocks.", "blk.", "layers."):
         if name.startswith(prefix):
             rest = name[len(prefix):]
             dot = rest.find(".")
             if dot != -1:
                 try:
-                    return int(rest[:dot])
+                    raw = int(rest[:dot])
+                    if prefix == "single_blocks.":
+                        return 1000 + raw
+                    return raw
                 except ValueError:
                     pass
     return -1
@@ -110,12 +116,18 @@ def reindex_tensor_name(orig_name: str, drop_set: set) -> str:
             dot = rest.find(".")
             if dot != -1:
                 try:
-                    old_id = int(rest[:dot])
+                    old_raw = int(rest[:dot])
+                    old_id = 1000 + old_raw if prefix == "single_blocks." else old_raw
                     if old_id in drop_set:
                         return None
-                    drops_before = sum(1 for d in drop_set if d < old_id)
-                    new_id = old_id - drops_before
-                    return f"{prefix}{new_id}{rest[dot:]}"
+                    # Count drops in the same namespace only: singles live at
+                    # 1000+, everything else below 1000.
+                    if prefix == "single_blocks.":
+                        drops_before = sum(1 for d in drop_set if d >= 1000 and d < old_id)
+                    else:
+                        drops_before = sum(1 for d in drop_set if d < 1000 and d < old_id)
+                    new_raw = old_raw - drops_before
+                    return f"{prefix}{new_raw}{rest[dot:]}"
                 except ValueError:
                     pass
     return orig_name
@@ -243,6 +255,11 @@ def fuse_model(base_path: str, lora_path: str, out_path: str, strength: float = 
         lora_diff = f"{base_cand[:-7]}.diff" if is_weight else None
         lora_down = f"{base_cand[:-7]}.lora_down.weight" if is_weight else None
         lora_up = f"{base_cand[:-7]}.lora_up.weight" if is_weight else None
+        # Alternate ComfyUI convention: lora_A (down, r x in) / lora_B (up, out x r)
+        lora_A = f"{base_cand[:-7]}.lora_A.weight" if is_weight else None
+        lora_B = f"{base_cand[:-7]}.lora_B.weight" if is_weight else None
+        if lora_down not in lora and lora_A in lora and lora_B in lora:
+            lora_down, lora_up = lora_A, lora_B
 
         # 1. BIAS / 1D TENSOR FUSION
         if is_bias and lora_diff_b and lora_diff_b in lora:

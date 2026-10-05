@@ -13,6 +13,10 @@ use std::text
 use std::bytes
 use std::fs
 use std::process
+use std::os
+
+@extern
+pub fn system(cmd: String) -> Int
 
 // ── kernel32 Win32 DMA File API ─────────────────────────────────────────────
 @extern @link_name("CreateFileA")
@@ -53,6 +57,18 @@ pub const GGUF_MAGIC: Int = 1179993927 // 'GGUF' in LE: 0x46554747
 pub const PI: Float = 3.141592653589793
 pub const TWO_PI: Float = 6.283185307179586
 
+// ── Dense Layer & Block Statistics ─────────────────────────────────────────
+pub struct BlockDenseStats:
+    block_idx: Int
+    total_elements: Int
+    frobenius_norm: Float
+    rms_energy: Float
+    variance: Float
+    kurtosis: Float
+    max_abs: Float
+    delta_gain_db: Float
+    sample: Array<Float>
+
 // ── Pointer & Byte Primitives ──────────────────────────────────────────────
 pub fn null_ptr() -> ptr<Void> with Pure:
     return int_to_ptr(0, "ptr<Void>")
@@ -62,6 +78,18 @@ pub fn bref(buf: ptr<Byte>, i: Int) -> Int with Unsafe:
 
 pub fn bstore(buf: ptr<Byte>, i: Int, v: Int) with Unsafe:
     mem_store(ptr_offset(buf, i, "Byte"), v as Byte, "Byte")
+
+pub fn resolve_juicer_python() -> String with Unsafe:
+    var py_bin: String = os_getenv_default("JUICER_PY", "")
+    if len(py_bin) == 0:
+        let comfy_py: String = os_getenv_default("JUICER_COMFY_PY", "S:/Local/ComfyUI_windows_portable/python_embeded/python.exe")
+        let h_chk: ptr<Void> = k_open_read(comfy_py)
+        if k_handle_bad(h_chk) == 0:
+            let _c: Int = k_CloseHandle(h_chk)
+            py_bin = comfy_py
+        else:
+            py_bin = "python"
+    return py_bin
 
 pub fn k_open_read(path: String) -> ptr<Void> with Unsafe:
     return k_CreateFileA(path, GEN_READ, FILE_SHARE_RW, null_ptr(), OPEN_EXISTING, FILE_NORMAL, null_ptr())
@@ -508,6 +536,36 @@ pub fn fp16_to_fp32(u16: Int) -> Float with Pure:
 
 pub fn bf16_to_fp32(u16: Int) -> Float with Pure:
     return f32_from_bits(u16 << 16)
+
+pub fn fp8_e4m3_to_fp32(u8: Int) -> Float with Pure:
+    let sign: Int = (u8 >> 7) & 1
+    let exp: Int = (u8 >> 3) & 15
+    let mant: Int = u8 & 7
+    var sgn: Float = 1.0
+    if sign == 1:
+        sgn = 0.0 - 1.0
+    if exp == 0:
+        // Subnormal: 2^-6 * (mant / 8)
+        return sgn * 0.015625 * ((mant as Float) / 8.0)
+    if exp == 15:
+        if mant == 7:
+            return sgn * 999999999.0 // NaN -> large finite sentinel
+        return sgn * 448.0 // E4M3 max normal clamps here
+    let frac: Float = 1.0 + (mant as Float) / 8.0
+    let shift: Int = exp - 8
+    var p2: Float = 1.0
+    if shift > 0:
+        var si: Int = 0
+        while si < shift:
+            p2 = p2 * 2.0
+            si = si + 1
+    elif shift < 0:
+        var si: Int = 0
+        let neg_shift: Int = 0 - shift
+        while si < neg_shift:
+            p2 = p2 * 0.5
+            si = si + 1
+    return sgn * frac * p2
 
 pub fn sk_bitrev(re: ptr<Float>, im: ptr<Float>, n: Int) -> Int with Unsafe:
     var j: Int = 0

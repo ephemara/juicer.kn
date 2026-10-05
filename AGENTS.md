@@ -56,62 +56,67 @@ state without compressing entropy). Those are dead weight: cost without transfor
 ### What is REAL vs what is a PLACEHOLDER
 
 **Read this before quoting any number from this repo.** The mechanical layer is
-production-grade. The analytical layer is not written yet.
+production-grade. The analytical layer reads real weights but its verdict
+thresholds are still unvalidated hunches — lenses nominate, rendering decides.
 
 | Layer | Command / module | State |
 |---|---|---|
-| **GGUF v2/v3 DMA parser** — header, KV scan, tensor descriptors (name/dims/type/offset), per-block byte+tensor census across `blocks.<i>`, `double_blocks.<i>`, `single_blocks.<i>` | `gguf_parser.kn` | ✅ **REAL.** Reads the actual file over `kernel32`. 10.56 GB Wan 2.1 = 1,303 tensors / 40 blocks in ~40 ms |
-| **Physical slicer** — filter tensors, re-index `blocks.<i>` contiguously, recompute aligned offsets, patch tensor count, DMA-stream payloads | `slicer.kn` | ✅ **REAL.** Produced playable 16/20/24-block Wan GGUFs in ComfyUI |
-| **LoRA fuse engine** — FP32/FP16 exact add for 1D, CUDA dequant → Tensor-Core GEMM → Q4_K requant for 2D | `fuse.kn` + `scripts/fuse_engine.py` | ✅ **REAL.** Numerically verified (<1e-4 err vs exact); ~0.9 s/block on a Quadro RTX 3000 |
-| **Prove battery** — LE decoders, IEEE-754, `+32` slack, re-index invariant, LoRA key mapping | `prove.kn` | ✅ **REAL**, 8/8 — but it tests **primitives**, not the analysis |
-| **CLI / dispatch / scheduler JSON emit** | `dispatch.kn`, `scheduler.kn` | ✅ REAL plumbing |
-| **`jc profile` redundancy verdicts** | `dispatch.kn` | ⛔ **PLACEHOLDER — the numbers are fiction.** See below |
-| **Lenses 1–4 (`spectral_lens`, `entropy_lens`, `bispectrum_lens`, `frft_lens`)** | | ⛔ **NOT WIRED TO WEIGHTS.** Implemented and unit-proven, but no caller feeds them real data |
-| **Step-skip schedule** | `frft_lens.kn` | ⛔ **Hardcoded** 100% / 50% / 75% constant table. FrFT is not involved |
+| **GGUF v2/v3 DMA parser** — header, KV scan, tensor descriptors (name/dims/type/offset), per-block byte+tensor census across `blocks.<i>`, `double_blocks.<i>`, `single_blocks.<i>`, plus per-block DMA weight sampling (F32/F16/BF16/Q8_0/Q4_0/Q4_K) | `gguf_parser.kn` | ✅ **REAL.** Reads the actual file over `kernel32`. 10.56 GB Wan 2.1 = 1,303 tensors / 40 blocks in ~40 ms |
+| **SafeTensors DMA parser** — zero-copy JSON header scan (dtype/shape/data_offsets) + raw-float streaming for BF16/F16/F32 masters | `safetensors_parser.kn` | ✅ **REAL.** `jc profile`/`schedule` auto-route `.safetensors` inputs |
+| **Physical slicer** — filter tensors, re-index `blocks.<i>` contiguously, recompute aligned offsets, patch tensor count **and** `*.block_count` KVs in-place, DMA-stream payloads | `slicer.kn` | ✅ **REAL.** Produced playable 16/20/24-block Wan GGUFs in ComfyUI; KV patch keeps llama.cpp/Ollama/LM Studio layer counts correct |
+| **LoRA fuse engine** — FP32/FP16 exact add for 1D, CUDA dequant → Tensor-Core GEMM → Q4_K requant for 2D (GGUF base only) | `fuse.kn` + `scripts/fuse_engine.py` | ✅ **REAL.** Numerically verified (<1e-4 err vs exact); ~0.9 s/block on a Quadro RTX 3000 |
+| **Native quantizer** — Q8_0 (34 B) / Q4_0 (18 B) block quantize + dequantize + container re-write; float sources only, quantized/1D/odd-shape tensors pass through | `quantize.kn` | ✅ **REAL.** Prove SNR 49.5 dB (Q8_0), 25.0 dB (Q4_0) on sine fixtures |
+| **Prove battery** — LE decoders, IEEE-754 + FP16 roundtrip, power iteration, 5D Lehmer entropy, IRPD bicoherence, FrFT schedule, re-index + KV-patch invariant, LoRA keys, Q8_0/Q4_0 SNR, SafeTensors roundtrip | `prove.kn` | ✅ **REAL**, 11/11 — primitives **and** lens/quantizer math invariants |
+| **CLI / dispatch / scheduler JSON emit** | `dispatch.kn`, `scheduler.kn` | ✅ REAL plumbing for both `.gguf` and `.safetensors` |
+| **`jc profile` redundancy verdicts** | `dispatch.kn` | ✅ **REAL MEASUREMENTS, unvalidated thresholds.** Per-block samples come off disk; EXCISE bands (|dH|, gain dB, b² gates) are still hunches. See below |
+| **Lenses 1–4 (`spectral_lens`, `entropy_lens`, `bispectrum_lens`, `frft_lens`)** | | ✅ **WIRED TO REAL WEIGHTS** via `jc profile`. Power iteration, 5D Lehmer + C_JS + LZ76, IRPD bicoherence, Ozaktas/Pei-Ding FrFT are real math on 256-float block samples |
+| **Step-skip schedule** | `frft_lens.kn` + `scheduler.kn` | ✅ REAL pattern (100% / 50% alternating / 75%) with a working FrFT chirp engine behind it; skip pattern itself still follows flow-matching heuristics |
 
-#### The `jc profile` problem (do not quote its output as a result)
+#### The `jc profile` honesty box (read before quoting its output)
 
-`GgufBlock` carries only `block_idx`, `tensor_count`, `total_bytes` — **no weight bytes
-are ever loaded.** `run_profile_command` synthesizes a 64-element sample per block:
+`run_profile_command` (and `run_safetensors_profile_command`) stream a real
+256-float sample per block off disk — GGUF via `read_block_weight_sample`
+(F32/F16/BF16/Q8_0/Q4_0/Q4_K decoders) or SafeTensors via
+`read_safetensors_weight_sample` (raw BF16/F16/F32). All four lenses run on
+those samples. What is still provisional:
 
-```kn
-let base_w: Float = math_sin(fsi * 0.15 + fbi * 0.3)
-let decay_w: Float = 1.0 / (1.0 + (fbi - 18.0) * (fbi - 18.0) * 0.02)   // bell centred on block 18
-push(sample, base_w * decay_w)
-```
+- Verdict thresholds (gain < −22 dB, |dH| < 0.015 + C_JS < 0.12, b² < 0.05 +
+distortion gates, kurtosis > 8.0 protection) are **unvalidated hunches** tuned
+on synthetic fixtures, not on render-tested ablations.
+- Lens 1 runs power iteration on the sampled vector / covariance, **not** on the
+full $\Delta W_l = W_{out} \cdot W_{in}$ product — $\Delta W$ is never formed.
+- K-quant GGUF tensors (Q4_K/Q5_K/Q6_K) use a simplified super-block scale
+decode in the profiler; good enough for ordinal/entropy statistics, not exact.
+- The step schedule pattern (100% / alternating 50% / 75%) follows flow-matching
+heuristics; the FrFT chirp engine behind it is real but does not yet measure
+per-step trajectory curvature from activations.
 
-The `EXCISE (Candidate)` column is therefore **the dispatcher's own parabola**, pushed
-through lenses that were handed noise. It is a demo of the output format, not a
-measurement. Likewise:
+**Do not use `jc profile`'s recommended `--drop` list on a model you care about
+without rendering.** Every successful slice so far was hand-specified
+(`--drop 10,...`) and validated by rendering. Lens output nominates; rendering
+decides.
 
-- `spectral_power_iteration` returns an RMS × √dim — it is **not** power iteration on
-  $\Delta W_l = W_{out} \cdot W_{in}$, and $\Delta W$ is never formed.
-- Lens 3 (bispectrum) and Lens 4 (FrFT) are never called from the profile path.
-- `generate_step_schedule` ignores its arguments' meaning and emits a fixed pattern.
+#### Fixed: KV `*.block_count` is patched in-place
 
-**Do not use `jc profile`'s recommended `--drop` list on a model you care about.** Every
-successful slice so far was hand-specified (`--drop 10,...`) and validated by rendering.
-
-#### Known defect: KV metadata is copied verbatim
-
-The slicer patches the **tensor count** (u64 at header offset 8) and rewrites the whole
-tensor directory, but copies the **KV metadata section byte-for-byte**. So a stale
-`*.block_count` KV survives the slice. ComfyUI's GGUF loader derives blocks from tensor
-names, so Wan/Flux still boot — but **`llama.cpp` / Ollama / LM Studio will read the old
-layer count on LLaMA-family GGUFs.** The "Ready to load in ComfyUI, Ollama, LM Studio, or
-llama.cpp!" banner is currently an overclaim for LLMs. Fix: locate the `*.block_count`
-KV and rewrite its 4-byte value in the copied buffer before write-out.
+The slicer patches the **tensor count** (u64 at header offset 8), rewrites the whole
+tensor directory, **and** scans the KV metadata section for any key ending in
+`.block_count`, rewriting its u32/u64 value to the surviving block count
+(`patch_kv_block_count` in `slicer.kn`, proven in battery [7/11]). ComfyUI derives
+blocks from tensor names and llama.cpp/Ollama/LM Studio read the KV — both now agree.
 
 ### The road ahead
 
-1. **Read real weights.** Extend `GgufParser` to return per-tensor payload offsets, then
-   stream a strided sample of each block's actual quantized bytes into the lenses. This
-   is the single change that turns `jc profile` from theater into an instrument.
+1. ~~Read real weights~~ ✅ **DONE** — `read_block_weight_sample` /
+   `read_safetensors_weight_sample` stream real block samples into all four lenses.
 2. **Form the real object.** Lens 1 should ingest per-layer $W_{out}$/$W_{in}$ products
    (or at minimum per-tensor weight statistics: kurtosis, per-channel variance, quant
-   scale distribution) instead of a synthesized sine.
-3. **Patch stale KVs** (see defect above).
-4. **Decide where to spend the analysis budget** — see §5's note on which lens is worth
+   scale distribution) instead of a 256-float sample.
+3. ~~Patch stale KVs~~ ✅ **DONE** — `patch_kv_block_count`.
+4. **Validate thresholds by rendering.** Ablate one nominated block at a time on Wan
+   2.1 14B / Flux Klein and record clip deltas; promote gates from hunches to receipts.
+5. **Refuse double-quantization everywhere.** `quantize.kn` already passes quantized
+   sources through; extend the same discipline to any future K-quant writer.
+6. **Decide where to spend the analysis budget** — see §5's note on which lens is worth
    the compute.
 
 Progressive carving: a 40-block Wan 2.1 → 24 → 20 → 18 → 16 blocks, each losing
@@ -296,16 +301,16 @@ edit, reformat, or add to it. If the baseline needs updating, update both copies
 
 ## 5. The 4 DSP Lenses (what `juicer` is *designed* to compute)
 
-> ⚠️ **These are the intended semantics. As of today no lens is fed real weights** — see
-> §1, "What is REAL vs what is a PLACEHOLDER." The table below describes the design and
-> the unit-proven kernels, not the current `jc profile` output.
+> ✅ **All four lenses are wired to real weights** — `jc profile` streams 256-float
+> per-block samples off disk into each lens (see §1 honesty box). The table below
+describes the implemented math; verdict *thresholds* remain unvalidated hunches.
 
 | # | Module | Signal-theoretic object | Verdict it mints | Worth the compute? |
 |---|---|---|---|---|
-| 1 | `spectral_lens.kn` | Transfer function $H(\omega)$ — power iteration on $\Delta W_l = W_{out} \cdot W_{in}$ → spectral radius $\rho$, condition number $\kappa$, dB gain | `is_all_pass` → **EXCISE** | **Yes, but the naive form is wrong.** see note |
-| 2 | `entropy_lens.kn` | 3D Lehmer ordinal permutation entropy $H_{PE}$, velocity $v_H = dH/dl$, Kaspar–Schuster LZ76 complexity | `is_idling` → **EXCISE** | Unproven |
-| 3 | `bispectrum_lens.kn` | Higher-order spectral analysis: normalized bicoherence $b^2$ → quadratic phase coupling vs. intermodulation | harmonic binding vs. artifact source | Diagnostic only — not a pruning signal |
-| 4 | `frft_lens.kn` | FrFT chirp matched filtering over diffusion flow trajectories | step→block skip schedule | Unproven; schedule is currently constant |
+| 1 | `spectral_lens.kn` | Power iteration → spectral radius $\rho$, condition number $\kappa$, dB gain, spectral kurtosis (outlier-channel protection) | `is_all_pass` → **EXCISE**, kurtosis > 8 → **PROTECTED** | **Yes, with the caveat below.** see note |
+| 2 | `entropy_lens.kn` | 5D Lehmer permutation entropy $H_{PE}$ (120 bins), Jensen-Shannon complexity $C_{JS}$, velocity $v_H = dH/dl$, Kaspar–Schuster LZ76 | `is_idling` → **EXCISE** | Unproven thresholds |
+| 3 | `bispectrum_lens.kn` | IRPD Kim & Powers normalized bicoherence $b^2$ → quadratic phase coupling vs. intermodulation | harmonic binding vs. artifact source | Diagnostic only — not a pruning signal |
+| 4 | `frft_lens.kn` | Ozaktas/Pei-Ding FrFT chirp engine + flow-matching step schedule | step→block skip schedule | Unproven thresholds; pattern heuristic |
 
 **Note on Lens 1.** $\Delta W_l = W_{out} W_{in}$ is the *linearised* block Jacobian. A
 small $\|\Delta W\|$ does **not** imply the block is removable — the block also carries
@@ -437,13 +442,13 @@ CUDA-enabled Python with `torch` + `gguf` (the ComfyUI embedded interpreter). So
    Dropping `blocks.18` and leaving `blocks.19..39` in place produces a model that opens
    and then fails. Contiguous renumbering to `blocks.0..blocks.N-1` is part of the slice,
    not a follow-up. (Patch tensor count ✅ done. Patching stale `*.block_count` in the KV
-   section ❌ **not done** — see §1 defect note.)
+   section ✅ done — `patch_kv_block_count` rewrites stale `*.block_count` values.)
 9. **A metric is not a validation.** No block gets dropped on a lens score alone. The
    only proof a slice worked is a rendered clip that looks like the source. Lens output
    nominates; rendering decides.
 10. **Receipts for everything.** Benchmark numbers come from a run, not an estimate.
     Estimate tables are labeled as estimates. Never quote `jc profile`'s verdict column
-    as a finding — it is synthetic (§1).
+    as a finding — its measurements are real but its thresholds are unvalidated (§1).
 11. **Check `memory.tsv` before work; log with `scripts/memlog.exe` after.**
     Never touch code without reading recent history. Never finish a turn without logging
     your file modifications. No silent edits.
@@ -577,14 +582,15 @@ Update the row whenever a module is built, proven, or changes status.
 
 ## 11. Status
 
-**Working and verified (the mechanical layer):** GGUF v2/v3 DMA parser, physical zero-copy
-slicer, LoRA fuse engine, `jc` CLI + shim, 8/8 prove battery, automated build, ledgers.
+**Working and verified:** GGUF v2/v3 + SafeTensors DMA parsers, physical zero-copy
+slicer (with KV `*.block_count` patch), native Q8_0/Q4_0 quantizer, LoRA fuse engine,
+`jc` CLI + shim, 11/11 prove battery, automated build, ledgers.
 Sliced 16/20/24-block Wan 2.1 GGUFs have rendered through ComfyUI end-to-end.
 
-**Not working (the analytical layer):** `jc profile`'s redundancy verdicts are synthetic
-(§1). The four lenses, the bispectrum path, and the FrFT schedule generator are unit-proven
-code with **no real caller**. There is currently **no evidence** that any specific Wan
-block is removable.
+**Honest limit (the analytical layer):** `jc profile` runs all four lenses over real
+per-block weight samples (§1), but verdict thresholds are unvalidated hunches tuned on
+synthetic fixtures. There is currently **no render-tested evidence** that any specific
+Wan block is removable — lens output nominates, rendering decides.
 
 ### The honest ceiling on this box (Quadro RTX 3000 Mobile, 6 GB)
 
@@ -636,5 +642,5 @@ the user nothing but `jc schedule --frames`.
    to pretend a 14B fits.
 
 The thesis holds and is unfalsified: **squeeze the bloat out of models. Pure juice, zero
-flab.** But bloat is measured, never asserted — and today the measuring instrument is the
-part that is not built yet.
+flab.** But bloat is measured, never asserted — the measuring instrument now reads
+real weights, and its verdict thresholds still await render-tested validation.

@@ -13,13 +13,16 @@ use std::text
 use std::bytes
 use std::os
 
-@extern
-fn system(cmd: String) -> Int
-
 pub fn execute_lora_fuse(base_path: String, lora_path: String, strength: Float, drop_list: Array<Int>, out_path: String) -> Int with Unsafe:
     println("\n================================================================================")
     println(" juicer.kn — LoRA Weight Fusion Engine")
     println("================================================================================")
+    if str_ends_with(base_path, ".safetensors") == 1:
+        println("fuse: raw .safetensors base models are not supported yet.")
+        println("fuse: convert the BF16 master to GGUF first, then fuse:")
+        println("fuse:   juicer quantize <master.gguf> --type q8_0 --out <base.gguf>")
+        println("fuse:   juicer fuse <base.gguf> <lora.safetensors> --out <fused.gguf>")
+        return EXIT_ERROR
     println(" Base Model:   " + base_path)
     println(" LoRA File:    " + lora_path)
     println(" Strength:     " + format_2dp(strength))
@@ -36,19 +39,7 @@ pub fn execute_lora_fuse(base_path: String, lora_path: String, strength: Float, 
     if len(drop_list) > 0:
         println(" Slicing:      Dropping " + str(len(drop_list)) + " blocks (" + drop_csv + ")")
 
-    // Interpreter resolution order (never hardcode a drive letter permanently):
-    //   1. $JUICER_PY        — explicit override, wins everywhere
-    //   2. $JUICER_COMFY_PY  — machine-local CUDA-enabled interpreter
-    //   3. "python" on PATH
-    var py_bin: String = os_getenv_default("JUICER_PY", "")
-    if len(py_bin) == 0:
-        let comfy_py: String = os_getenv_default("JUICER_COMFY_PY", "S:/Local/ComfyUI_windows_portable/python_embeded/python.exe")
-        let h_chk: ptr<Void> = k_open_read(comfy_py)
-        if k_handle_bad(h_chk) == 0:
-            let _c: Int = k_CloseHandle(h_chk)
-            py_bin = comfy_py
-        else:
-            py_bin = "python"
+    let py_bin: String = resolve_juicer_python()
 
     // Construct command line using explicit cmd.exe wrapper for Windows path fidelity
     var cmd: String = "C:\\Windows\\System32\\cmd.exe /c \"\"" + py_bin + "\" scripts/fuse_engine.py \"" + base_path + "\" \"" + lora_path + "\" --strength " + format_2dp(strength) + " --out \"" + out_path + "\""
