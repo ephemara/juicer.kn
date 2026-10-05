@@ -164,10 +164,7 @@ L0 plain      fn · struct · let · mut · enum · trait · impl
 cannot execute hidden side effects. `juicer.kn` is almost entirely `with Unsafe` — it
 writes through raw pointers and calls Win32.
 
-**Dual host + GPU:** Kain compiles CPU host code and GPU compute kernels
-(`shader compute`) from the same `.kn` file, emitting SPIR-V / PTX / HLSL. `juicer.kn`
-does *not* need this — its hot path is **CPU + kernel32 DMA**. (The CUDA work lives in
-the Python `fuse_engine.py` sidecar, see §6.)
+**Dual host + GPU (Kain is a GPU/CPU language — use it):** Kain compiles CPU host code and GPU compute kernels (`shader compute`) from the same `.kn` file, emitting SPIR-V / PTX / HLSL. Stdlib surface is `std::cuda` (`../kain/stdlib/cuda.kn`: PTX intrinsics, warp sync, `cuda_shfl_*`, `cuda_cp_async_*`, `cuda_require_tensor_cores`/`cuda_require_wgmma`) + `std::gpu` (`../kain/stdlib/gpu.kn`: stages, queues, residency, pipeline-library caching). `juicer.kn` uses BOTH sides, not CPU-only: the bulk path is **CPU + kernel32 DMA**, and fusion is **native GPU** via `kain/core/gpu_bridge.kn` (zero-dependency `nvcuda.dll` driver bridge: `cuInit` -> `cuCtxCreate` -> `cuModuleLoadData` (Kain PTX) -> `cuLaunchKernel`, Win64 trampoline, `with GPU` effects) + `kain/gpu/fusion_kernel.kn` (`shader compute FuseLoRA`, dual-mode LoRA GEMM + LoKR Kronecker). Proved by `jc gpu-probe` (driver/context/VRAM/Kain-PTX JIT) and `jc gpu-fuse-test` (on-device numerics vs CPU GEMM). The Python `fuse_engine.py` sidecar is a LEGACY fallback for Q4_K bases until the native Q4_K encoder lands — never the default for new GPU work (see §6).
 
 For `juicer.kn` the constructs that actually matter are **`fn` / `struct` / `let` /
 `while` / `if`** (the whole `kain/core` suite is plain L0 with `@extern` FFI), plus
@@ -365,15 +362,18 @@ juicer.kn/ (repo root)
 │   │   ├── frft_lens.kn       # Lens 4 + step schedule generator
 │   │   ├── slicer.kn          # physical excision + contiguous re-index + header rewrite
 │   │   ├── scheduler.kn       # JSON step-skip recipe emitter
-│   │   ├── fuse.kn            # LoRA fusion driver (delegates to scripts/fuse_engine.py)
+│   │   ├── fuse.kn            # LoRA fusion router: --native = 100% in-Kain GPU, else python fallback
+│   │   ├── gpu_bridge.kn      # zero-dep nvcuda.dll bridge + gpu-probe/gpu-fuse-test + native fuse exec
 │   │   ├── prove.kn           # 8-battery in-memory formal verification suite
 │   │   └── dispatch.kn        # the ONLY main(); CLI router + profile table printer
+│   ├── gpu/
+│   │   └── fusion_kernel.kn # shader compute FuseLoRA (LoRA GEMM + LoKR Kronecker) -> PTX via `kain gpu-artifacts`
 │   ├── juicer.kn              # raw amalgamation of kain/core/*.kn (build artifact)
 │   └── .kain/                 # intermediate LLVM artifacts (gitignored)
 │
 ├── scripts/
 │   ├── build.py / build.cmd   # amalgamate -> build -> emit jc.exe
-│   ├── fuse_engine.py         # CUDA Tensor-Core fuse core (needs a CUDA-enabled python)
+│   ├── fuse_engine.py         # LEGACY python fallback: Q4_K Tensor-Core fuse (needs CUDA python); native GPU is default
 │   ├── benchmark_wan.py       # end-to-end ComfyUI inference benchmark (aiohttp driver)
 │   ├── start_comfy.py         # launch/attach the local ComfyUI server for benchmarks
 │   └── memlog.kn / memlog.exe # native ledger helper — logs every file change
@@ -391,15 +391,29 @@ does not exist on a fresh checkout and **must never be committed**). Never hardc
 target; take `--models-dir` / env, or pass the model path as an argv argument — which is
 what every `jc` command already does.
 
-### `scripts/fuse_engine.py` — the one sanctioned Python
+### `kain/gpu/` + `gpu_bridge.kn` — the native GPU path (default). Python is legacy fallback
 
-The rule everywhere else in this repo is **Kain computes, Python never re-implements a
-lane**. The fuse engine is the deliberate exception: it must run Tensor-Core GEMM +
-inline GGUF dequant + re-quant, and the only thing on the box that can do that is a
-CUDA-enabled Python with `torch` + `gguf` (the ComfyUI embedded interpreter). So:
+The rule everywhere in this repo is **Kain computes, Python never re-implements a
+lane**. Kain is a GPU/CPU language (`std::cuda` + `std::gpu` + `shader compute` ->
+PTX/SPIR-V/HLSL), so new GPU work goes in `kain/gpu/*.kn` + `kain/core/gpu_bridge.kn`
+and is proven with `jc gpu-probe` / `jc gpu-fuse-test` — never in a new Python file.
 
-- `kain/core/fuse.kn` is a **thin driver**: it validates argv, resolves an interpreter,
-  and shells out. All policy and all fusion math live in `scripts/fuse_engine.py`.
+- `kain/gpu/fusion_kernel.kn` is the compute kernel (`shader compute FuseLoRA`,
+  `workgroup(16,16,1)`, mode 0 = LoRA GEMM `B@A`, mode 1 = LoKR Kronecker).
+  Compiled with `kain gpu-artifacts` to `.kain/gpu/fusion.derived.sm_75.ptx`.
+- `kain/core/gpu_bridge.kn` is the zero-dependency host driver: loads the OS display
+  driver (`nvcuda.dll` — ships with Windows on every NVIDIA box, no CUDA Toolkit /
+  SDK / PyTorch), installs the Win64 trampoline, drives `cuInit` -> `cuCtxCreate` ->
+  `cuModuleLoadData` -> `cuLaunchKernel` -> `cuMemcpyDtoH`. `jc fuse --native` runs
+  100% in-Kain through this path (exact-decodable GGUF + safetensors LoRA, Q8_0 out).
+- `scripts/fuse_engine.py` (+ `quantize_engine.py`) is the LEGACY fallback: kept only
+  because native Q4_K encode/decode is not exact yet (python does GPU dequant ->
+  Tensor-Core GEMM -> Q4_K requant, and Q4_K_M safetensors->GGUF). Route there only
+  when `--lora` hits a Q4_K base or `--type q4_k` is requested; every other quantize/
+  fuse invocation stays native.
+- `kain/core/fuse.kn` is the router: `--native` (default whenever the base is exactly
+  decodable) executes the Kain GPU path; otherwise it validates argv, resolves an
+  interpreter, and shells out to the python fallback.
 - **Interpreter resolution (never hardcode a drive letter permanently):**
   `$JUICER_PY` → `$JUICER_COMFY_PY` → `S:/Local/ComfyUI_windows_portable/python_embeded/python.exe`
   (machine-local default, overridable) → `python` on PATH.
@@ -440,6 +454,7 @@ CUDA-enabled Python with `torch` + `gguf` (the ComfyUI embedded interpreter). So
    binary with `kernel32` as its only link-time import family; `nvcuda.dll` (the OS display
    driver, present on every NVIDIA Windows box) is loaded dynamically at runtime, and only
    on GPU commands (`gpu-probe`, `gpu-fuse-test`, `fuse --native`). CPU commands never touch it.
+   New GPU kernels go in `kain/gpu/` as `shader compute` + `gpu_bridge.kn` — never a new Python script.
 8. **Never write a sliced model without re-indexing it.**
    Dropping `blocks.18` and leaving `blocks.19..39` in place produces a model that opens
    and then fails. Contiguous renumbering to `blocks.0..blocks.N-1` is part of the slice,
