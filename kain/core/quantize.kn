@@ -196,6 +196,188 @@ pub fn dequantize_q8_0(in_bytes: ptr<Byte>, in_offset: Int, n_blocks: Int, out_f
         b = b + 1
     return 0
 
+// Dequantize Q2_K super-blocks (84 bytes -> 256 floats, llama.cpp-exact).
+// Layout: scales[16] (4-bit sc low nibble + 4-bit min high nibble per sub-block),
+// qs[64] (2-bit quants, see packing note in quantize_superblock_q2_k),
+// d (fp16), dmin (fp16) LAST. out = (d*sc)*q - (dmin*m).
+pub fn dequantize_q2_k(in_bytes: ptr<Byte>, in_offset: Int, n_super: Int, out_f32: ptr<Float>, out_offset: Int) -> Int with Unsafe:
+    var sbi: Int = 0
+    while sbi < n_super:
+        let base: Int = in_offset + sbi * 84
+        let d_f: Float = fp16_to_fp32(read_u16_le(in_bytes, base + 80))
+        let dmin_f: Float = fp16_to_fp32(read_u16_le(in_bytes, base + 82))
+        var j: Int = 0
+        while j < 16:
+            let sc_byte: Int = bref(in_bytes, base + j)
+            let sc4: Int = sc_byte & 15
+            let m4: Int = (sc_byte >> 4) & 15
+            let step: Float = d_f * (sc4 as Float)
+            let neg_min: Float = dmin_f * (m4 as Float)
+            let g: Int = j / 8
+            let m: Int = j % 8
+            let hseg: Int = (m % 2) * 16
+            let shift: Int = (m / 2) * 2
+            var w: Int = 0
+            while w < 16:
+                let bv: Int = bref(in_bytes, base + 16 + g * 32 + hseg + w)
+                let q: Int = (bv >> shift) & 3
+                mem_store(ptr_offset(out_f32, out_offset + sbi * 256 + j * 16 + w, "Float"), step * (q as Float) - neg_min, "Float")
+                w = w + 1
+            j = j + 1
+        sbi = sbi + 1
+    return 0
+
+// Quantize 256-element float buffer to GGUF Q2_K super-block (84 bytes) with
+// per-sub-block MSE step refinement. Packing (inverse of dequantize_q2_k):
+// value q[j][w] lives in byte g*32 + (m%2)*16 + w at shift ((m>>1)*2),
+// with g = j/8, m = j%8. Each byte accumulates 4 values via OR.
+pub fn quantize_superblock_q2_k(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<Byte>, out_offset: Int) -> Int with Unsafe:
+    // Pass 1: per-sub-block min/max
+    let mn: ptr<Float> = alloc_zeroed(16 + 32, "Float")
+    let mx: ptr<Float> = alloc_zeroed(16 + 32, "Float")
+    var j: Int = 0
+    while j < 16:
+        var lo: Float = mem_load(ptr_offset(in_f32, in_offset + j * 16, "Float"), "Float")
+        var hi: Float = lo
+        var w: Int = 1
+        while w < 16:
+            let v: Float = mem_load(ptr_offset(in_f32, in_offset + j * 16 + w, "Float"), "Float")
+            if v < lo:
+                lo = v
+            if v > hi:
+                hi = v
+            w = w + 1
+        mem_store(ptr_offset(mn, j, "Float"), lo, "Float")
+        mem_store(ptr_offset(mx, j, "Float"), hi, "Float")
+        j = j + 1
+    // Global super-scales from worst sub-block ranges
+    var max_range: Float = 0.0
+    var max_neg: Float = 0.0
+    var jj: Int = 0
+    while jj < 16:
+        let lo: Float = mem_load(ptr_offset(mn, jj, "Float"), "Float")
+        let hi: Float = mem_load(ptr_offset(mx, jj, "Float"), "Float")
+        let r: Float = hi - lo
+        if r > max_range:
+            max_range = r
+        let nm: Float = 0.0 - lo
+        if nm > max_neg:
+            max_neg = nm
+        jj = jj + 1
+    var d_base: Float = max_range / 45.0
+    if d_base < 0.000000000001:
+        d_base = 0.000000000001
+    var dmin_base: Float = max_neg / 15.0
+    if dmin_base < 0.000000000001:
+        dmin_base = 0.000000000001
+    let d_u16: Int = fp32_to_fp16(d_base)
+    let dmin_u16: Int = fp32_to_fp16(dmin_base)
+    let d_ex: Float = fp16_to_fp32(d_u16)
+    let dmin_ex: Float = fp16_to_fp32(dmin_u16)
+    // NOTE: d/dmin are written LAST (after packing). Bulk byte loops auto-vectorize
+    // and overrun up to 31 bytes past their logical end; writing the trailing
+    // super-scales last keeps them out of every overrun window.
+    // Pass 2: per-sub-block 4-bit sc/m + MSE step refinement over alphas
+    let sc4_arr: ptr<Int> = alloc_zeroed(16 + 32, "Int")
+    let m4_arr: ptr<Int> = alloc_zeroed(16 + 32, "Int")
+    var j2: Int = 0
+    while j2 < 16:
+        let lo: Float = mem_load(ptr_offset(mn, j2, "Float"), "Float")
+        let hi: Float = mem_load(ptr_offset(mx, j2, "Float"), "Float")
+        var best_err: Float = 1000000000.0
+        var best_sc: Int = 0
+        var best_m: Int = 0
+        // Dual-regime search: regime A offsets downward (m from -lo, for lo<=0
+        // blocks); regime B spans from zero (m=0, sc from hi, for lo>0 blocks
+        // whose offset is unrepresentable since m can only subtract).
+        var cand: Int = 0
+        while cand < 6:
+            var alpha: Float = 1.0
+            if cand == 1: alpha = 0.90
+            elif cand == 2: alpha = 0.80
+            elif cand == 3: alpha = 0.70
+            elif cand == 4: alpha = 1.0
+            elif cand == 5: alpha = 0.85
+            var sc_try: Int = 0
+            var m_try: Int = 0
+            if cand < 4:
+                sc_try = ((hi - lo) / (3.0 * d_ex * alpha) + 0.5) as Int
+                if sc_try > 15: sc_try = 15
+                if sc_try < 0: sc_try = 0
+                m_try = ((0.0 - lo) / dmin_ex + 0.5) as Int
+                if m_try > 15: m_try = 15
+                if m_try < 0: m_try = 0
+            else:
+                sc_try = (hi / (3.0 * d_ex * alpha) + 0.5) as Int
+                if sc_try > 15: sc_try = 15
+                if sc_try < 1: sc_try = 1
+                m_try = 0
+            let step_try: Float = d_ex * (sc_try as Float)
+            let min_try: Float = dmin_ex * (m_try as Float)
+            var err_acc: Float = 0.0
+            var w2: Int = 0
+            while w2 < 16:
+                let x: Float = mem_load(ptr_offset(in_f32, in_offset + j2 * 16 + w2, "Float"), "Float")
+                var q: Int = 0
+                if step_try > 0.000000000001:
+                    let t: Float = (x + min_try) / step_try
+                    q = (t + 0.5) as Int
+                    if t < 0.0:
+                        q = (t - 0.5) as Int
+                    if q > 3: q = 3
+                    if q < 0: q = 0
+                let recon: Float = step_try * (q as Float) - min_try
+                let diff: Float = x - recon
+                err_acc = err_acc + diff * diff
+                w2 = w2 + 1
+            if err_acc < best_err:
+                best_err = err_acc
+                best_sc = sc_try
+                best_m = m_try
+            cand = cand + 1
+        mem_store(ptr_offset(sc4_arr, j2, "Int"), best_sc, "Int")
+        mem_store(ptr_offset(m4_arr, j2, "Int"), best_m, "Int")
+        let sc_byte: Int = (best_sc & 15) | ((best_m & 15) << 4)
+        bstore(out_bytes, out_offset + j2, sc_byte)
+        j2 = j2 + 1
+    // Pass 3: pack 2-bit quants, one single store per qs byte (no RMW: the
+    // optimizer mishandles read-modify-write to the same byte across iterations).
+    // Byte B = g*32+i holds sub-blocks j = 8g+2s+(i/16), weight w = i%16 at shift 2s.
+    var pb: Int = 0
+    while pb < 64:
+        let pg: Int = pb / 32
+        let pi: Int = pb % 32
+        var acc: Int = 0
+        var ps: Int = 0
+        while ps < 4:
+            let pj: Int = 8 * pg + 2 * ps + pi / 16
+            let pw: Int = pi % 16
+            let psc: Int = mem_load(ptr_offset(sc4_arr, pj, "Int"), "Int")
+            let pmm: Int = mem_load(ptr_offset(m4_arr, pj, "Int"), "Int")
+            let pstep: Float = d_ex * (psc as Float)
+            let pneg: Float = dmin_ex * (pmm as Float)
+            let px: Float = mem_load(ptr_offset(in_f32, in_offset + pj * 16 + pw, "Float"), "Float")
+            var pq: Int = 0
+            if pstep > 0.000000000001:
+                let pt: Float = (px + pneg) / pstep
+                pq = (pt + 0.5) as Int
+                if pt < 0.0:
+                    pq = (pt - 0.5) as Int
+                if pq > 3: pq = 3
+                if pq < 0: pq = 0
+            acc = acc | (pq << (2 * ps))
+            ps = ps + 1
+        bstore(out_bytes, out_offset + 16 + pb, acc)
+        pb = pb + 1
+    // Trailing super-scales go last: bulk pack loops overrun into [80..84].
+    write_u16_le(out_bytes, out_offset + 80, d_u16)
+    write_u16_le(out_bytes, out_offset + 82, dmin_u16)
+    decay mn
+    decay mx
+    decay sc4_arr
+    decay m4_arr
+    return 0
+
 // Dequantize Q4_0 blocks to 32-element floats
 pub fn dequantize_q4_0(in_bytes: ptr<Byte>, in_offset: Int, n_blocks: Int, out_f32: ptr<Float>, out_offset: Int) -> Int with Unsafe:
     var b: Int = 0
@@ -255,6 +437,16 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
     var target_type_id: Int = 8 // Default Q8_0
     if target_format == "q4_0" or target_format == "q4":
         target_type_id = 2
+    if target_format == "q2_k" or target_format == "q2":
+        target_type_id = 10
+    // K-quant super-block grouping: 32 for Q8_0/Q4_0, 256 for Q2_K
+    var unit_elem: Int = 32
+    var unit_out: Int = 34
+    if target_type_id == 2:
+        unit_out = 18
+    if target_type_id == 10:
+        unit_elem = 256
+        unit_out = 84
 
     // Open source file
     let h_src: ptr<Void> = k_open_read(model.path)
@@ -332,13 +524,15 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
             total_elem = total_elem * st.dim2
         if st.n_dims >= 4:
             total_elem = total_elem * st.dim3
-        if st.n_dims >= 2 and (total_elem % 32) == 0:
+        if st.n_dims >= 2 and (total_elem % unit_elem) == 0 and (st.dim0 % unit_elem) == 0:
             if st.type_id == 0 or st.type_id == 1 or st.type_id == 28:
                 out_type = target_type_id
                 if target_type_id == 8:
                     out_bytes = (total_elem / 32) * 34
                 elif target_type_id == 2:
                     out_bytes = (total_elem / 32) * 18
+                elif target_type_id == 10:
+                    out_bytes = (total_elem / 256) * 84
 
         // Write type_id
         write_u32_le(t_buf, tb_off, out_type)
@@ -388,7 +582,7 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
             total_elem = total_elem * orig_t.dim3
 
         var is_recompressed: Int = 0
-        if orig_t.n_dims >= 2 and (total_elem % 32) == 0:
+        if orig_t.n_dims >= 2 and (total_elem % unit_elem) == 0 and (orig_t.dim0 % unit_elem) == 0:
             if orig_t.type_id == 0 or orig_t.type_id == 1 or orig_t.type_id == 28:
                 is_recompressed = 1
 
@@ -413,19 +607,21 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
             var src_bytes_per_elem: Int = 2
             if src_kind == 0:
                 src_bytes_per_elem = 4
-            let n_blocks: Int = total_elem / 32
+            let n_blocks: Int = total_elem / unit_elem
             var cur_b: Int = 0
             while cur_b < n_blocks:
                 var blocks_this_batch: Int = 2048
+                if target_type_id == 10:
+                    blocks_this_batch = 256
                 if cur_b + blocks_this_batch > n_blocks:
                     blocks_this_batch = n_blocks - cur_b
 
-                let elem_count: Int = blocks_this_batch * 32
+                let elem_count: Int = blocks_this_batch * unit_elem
                 let f32_arena: ptr<Float> = alloc_zeroed(elem_count + 32, "Float")
 
                 // Read + decode this batch according to the true source dtype
                 let batch_src_bytes: Int = elem_count * src_bytes_per_elem
-                let cur_src_byte_pos: Int = src_abs_off + (cur_b * 32 * src_bytes_per_elem)
+                let cur_src_byte_pos: Int = src_abs_off + (cur_b * unit_elem * src_bytes_per_elem)
                 let r_act: Int = k_read_at(h_src, nslot, cur_src_byte_pos, dma_buf, batch_src_bytes)
 
                 // Decode to F32
@@ -461,6 +657,15 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
                         b_idx = b_idx + 1
                     let _w_q: Int = k_write_all(h_dst, nslot, q_buf, batch_out_bytes)
                     decay q_buf
+                elif target_type_id == 10:
+                    batch_out_bytes = blocks_this_batch * 84
+                    let q_buf: ptr<Byte> = alloc_zeroed(batch_out_bytes + 32, "Byte")
+                    var b_idx: Int = 0
+                    while b_idx < blocks_this_batch:
+                        quantize_superblock_q2_k(f32_arena, b_idx * 256, q_buf, b_idx * 84)
+                        b_idx = b_idx + 1
+                    let _w_q: Int = k_write_all(h_dst, nslot, q_buf, batch_out_bytes)
+                    decay q_buf
 
                 decay f32_arena
                 cur_b = cur_b + blocks_this_batch
@@ -470,6 +675,7 @@ pub fn execute_model_quantize(model: GgufModel, target_format: String, out_path:
         if is_recompressed == 1:
             if target_type_id == 8: written_tensor_bytes = (total_elem / 32) * 34
             elif target_type_id == 2: written_tensor_bytes = (total_elem / 32) * 18
+            elif target_type_id == 10: written_tensor_bytes = (total_elem / 256) * 84
 
         let t_pad: Int = (model.alignment - (written_tensor_bytes % model.alignment)) % model.alignment
         if t_pad > 0:
@@ -548,6 +754,7 @@ pub fn write_gguf_kv_u32(buf: ptr<Byte>, off: Int, key: String, val: Int) -> Int
 
 // High-level SafeTensors -> GGUF Direct Quantization Pipeline (100% Native Pure Kain)
 pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: String, out_path: String) -> Int with Unsafe:
+    let ms_start: Int = wall_ms()
     println("\n================================================================================")
     println(" juicer.kn — Direct SafeTensors -> GGUF Native Quantization Engine")
     println("================================================================================")
@@ -560,6 +767,17 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
     if target_format == "q4_0" or target_format == "q4":
         target_type_id = 2
         file_type = 2
+    if target_format == "q2_k" or target_format == "q2":
+        target_type_id = 10
+        file_type = 10
+    // K-quant super-block grouping: 32 for Q8_0/Q4_0, 256 for Q2_K
+    var unit_elem: Int = 32
+    var unit_out: Int = 34
+    if target_type_id == 2:
+        unit_out = 18
+    if target_type_id == 10:
+        unit_elem = 256
+        unit_out = 84
 
     // Detect model architecture
     var arch_name: String = "flux"
@@ -706,12 +924,21 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
             out_type = 0
             out_bytes = total_elem * 4
 
-        if st.n_dims >= 2 and (total_elem % 32) == 0:
+        var lastd_s: Int = st.dim0
+        if st.n_dims == 2:
+            lastd_s = st.dim1
+        elif st.n_dims == 3:
+            lastd_s = st.dim2
+        elif st.n_dims >= 4:
+            lastd_s = st.dim3
+        if st.n_dims >= 2 and (total_elem % unit_elem) == 0 and (lastd_s % unit_elem) == 0:
             out_type = target_type_id
             if target_type_id == 8:
                 out_bytes = (total_elem / 32) * 34
             elif target_type_id == 2:
                 out_bytes = (total_elem / 32) * 18
+            elif target_type_id == 10:
+                out_bytes = (total_elem / 256) * 84
 
         // Write type_id
         write_u32_le(t_buf, tb_off, out_type)
@@ -758,7 +985,14 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
         if st.n_dims >= 4: total_elem = total_elem * st.dim3
 
         var is_recompressed: Int = 0
-        if st.n_dims >= 2 and (total_elem % 32) == 0:
+        var lastd_t: Int = st.dim0
+        if st.n_dims == 2:
+            lastd_t = st.dim1
+        elif st.n_dims == 3:
+            lastd_t = st.dim2
+        elif st.n_dims >= 4:
+            lastd_t = st.dim3
+        if st.n_dims >= 2 and (total_elem % unit_elem) == 0 and (lastd_t % unit_elem) == 0:
             is_recompressed = 1
 
         var written_tensor_bytes: Int = 0
@@ -808,18 +1042,20 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
                 src_bytes_per_elem = 1
                 is_fp8 = 1
 
-            let n_blocks: Int = total_elem / 32
+            let n_blocks: Int = total_elem / unit_elem
             var cur_b: Int = 0
             while cur_b < n_blocks:
                 var blocks_this_batch: Int = 2048
+                if target_type_id == 10:
+                    blocks_this_batch = 256
                 if cur_b + blocks_this_batch > n_blocks:
                     blocks_this_batch = n_blocks - cur_b
 
-                let elem_count: Int = blocks_this_batch * 32
+                let elem_count: Int = blocks_this_batch * unit_elem
                 let f32_arena: ptr<Float> = alloc_zeroed(elem_count + 32, "Float")
 
                 let batch_src_bytes: Int = elem_count * src_bytes_per_elem
-                let cur_src_byte_pos: Int = src_abs_off + (cur_b * 32 * src_bytes_per_elem)
+                let cur_src_byte_pos: Int = src_abs_off + (cur_b * unit_elem * src_bytes_per_elem)
                 let r_act: Int = k_read_at(h_src, nslot, cur_src_byte_pos, dma_buf, batch_src_bytes)
 
                 // Decode to F32
@@ -854,6 +1090,8 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
                 var batch_out_bytes: Int = blocks_this_batch * 34
                 if target_type_id == 2:
                     batch_out_bytes = blocks_this_batch * 18
+                if target_type_id == 10:
+                    batch_out_bytes = blocks_this_batch * 84
 
                 let q_batch: ptr<Byte> = alloc_zeroed(batch_out_bytes + 32, "Byte")
                 var qbi: Int = 0
@@ -862,6 +1100,8 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
                         quantize_block_q8_0(f32_arena, qbi * 32, q_batch, qbi * 34)
                     elif target_type_id == 2:
                         quantize_block_q4_0(f32_arena, qbi * 32, q_batch, qbi * 18)
+                    elif target_type_id == 10:
+                        quantize_superblock_q2_k(f32_arena, qbi * 256, q_batch, qbi * 84)
                     qbi = qbi + 1
 
                 decay f32_arena
@@ -872,6 +1112,7 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
 
             if target_type_id == 8: written_tensor_bytes = (total_elem / 32) * 34
             elif target_type_id == 2: written_tensor_bytes = (total_elem / 32) * 18
+            elif target_type_id == 10: written_tensor_bytes = (total_elem / 256) * 84
 
         let t_pad: Int = (alignment - (written_tensor_bytes % alignment)) % alignment
         if t_pad > 0:
@@ -887,9 +1128,15 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
     let _c_s: Int = k_CloseHandle(h_src)
     let _c_d: Int = k_CloseHandle(h_dst)
 
+    let ms_done: Int = wall_ms()
+    let ms_elapsed: Int = ms_done - ms_start
+    var mb_s: Int = 0
+    if ms_elapsed > 0:
+        mb_s = (model.file_size / 1048576) / (ms_elapsed / 1000)
     println(" Direct SafeTensors Quantization complete!")
     println(" Quantized tensors: " + str(len(model.tensors) - passthrough_cnt))
     println(" Preserved floats:  " + str(passthrough_cnt))
+    println(" Elapsed:            " + str(ms_elapsed / 1000) + " s (" + str(mb_s) + " MB/s, 100% native Kain)")
     println(" Output GGUF:       " + out_path)
     return EXIT_OK
 

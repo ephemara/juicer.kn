@@ -40,6 +40,13 @@ pub fn k_CloseHandle(h: ptr<Void>) -> Int
 @extern @link_name("GetLastError")
 pub fn k_GetLastError() -> Int
 
+@extern @link_name("GetTickCount64")
+pub fn k_GetTickCount64() -> Int
+
+// Wall-clock milliseconds since boot (kernel32, no dependencies).
+pub fn wall_ms() -> Int with Unsafe:
+    return k_GetTickCount64()
+
 // ── Handle & Exit Constants ────────────────────────────────────────────────
 pub const GEN_READ: Int = 2147483648
 pub const GEN_WRITE: Int = 1073741824

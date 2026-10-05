@@ -8,7 +8,8 @@ with support for lossless multi-LoRA / LyCORIS LoKR baking in a single pass:
   - Supports standard Low-Rank GEMM (lora_up/down, lora_A/B, Kohya lora_unet_*)
   - Supports LyCORIS LoKR (Low-Rank Kronecker product: w1 (x) w2)
   - 1D Norms, Scales, Biases -> Preserved in exact FP32 / FP16
-  - 2D Linear Weights (cols % 256 == 0) -> Quantized to Q4_K super-blocks on GPU
+  - 2D Linear Weights (cols % 256 == 0) -> Quantized to Q4_K (144B) / Q6_K (210B)
+  super-blocks on GPU
   - Direct NVMe safe_open memory-mapped streaming: < 500 MB VRAM footprint
 """
 
@@ -26,7 +27,7 @@ import gguf
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-from fuse_engine import quantize_q4_k_gpu
+from fuse_engine import quantize_q4_k_gpu, quantize_q6_k_gpu
 
 def detect_architecture(keys):
     for k in keys:
@@ -149,6 +150,8 @@ def quantize_safetensors_to_gguf(src_path: str, out_path: str, quant_type: str =
         writer.add_uint32("general.quantization_version", 2)
         if quant_type.lower() == "q4_k":
             writer.add_uint32("general.file_type", 15) # Q4_K_M
+        elif quant_type.lower() == "q6_k":
+            writer.add_uint32("general.file_type", 18) # Q6_K
         else:
             writer.add_uint32("general.file_type", 7)  # Q8_0
 
@@ -187,15 +190,22 @@ def quantize_safetensors_to_gguf(src_path: str, out_path: str, quant_type: str =
             if has_fused:
                 fused_tensors_cnt += 1
 
-            if is_2d_quantizable and quant_type.lower() == "q4_k":
+            if is_2d_quantizable and quant_type.lower() in ("q4_k", "q6_k"):
                 # Quantize on GPU Tensor Cores
                 rows, cols = shape
-                quant_bytes = quantize_q4_k_gpu(w.half()).cpu().numpy().tobytes()
+                if quant_type.lower() == "q6_k":
+                    quant_bytes = quantize_q6_k_gpu(w.float()).cpu().numpy().tobytes()
+                    block_bytes = 210
+                    qtype = gguf.GGMLQuantizationType.Q6_K
+                else:
+                    quant_bytes = quantize_q4_k_gpu(w.half()).cpu().numpy().tobytes()
+                    block_bytes = 144
+                    qtype = gguf.GGMLQuantizationType.Q4_K
                 del w
 
-                raw_byte_shape = (rows, (cols // 256) * 144)
+                raw_byte_shape = (rows, (cols // 256) * block_bytes)
                 raw_arr = np.frombuffer(quant_bytes, dtype=np.uint8).reshape(raw_byte_shape)
-                writer.add_tensor(k, raw_arr, raw_shape=raw_byte_shape, raw_dtype=gguf.GGMLQuantizationType.Q4_K)
+                writer.add_tensor(k, raw_arr, raw_shape=raw_byte_shape, raw_dtype=qtype)
                 quant_cnt += 1
             else:
                 # 1D scalars, biases, norm scales: preserve in exact float
@@ -217,7 +227,7 @@ def quantize_safetensors_to_gguf(src_path: str, out_path: str, quant_type: str =
     print("=" * 80)
     print(" FUSION & QUANTIZATION COMPLETE!")
     print(f" Fused Adapters:    {len(adapters)} ({fused_tensors_cnt} tensors modified in pure float)")
-    print(f" Quantized Weights: {quant_cnt} tensors (Q4_K Super-Blocks)")
+    print(f" Quantized Weights: {quant_cnt} tensors ({quant_type.upper()} Super-Blocks)")
     print(f" Preserved Floats:  {passthrough_cnt} tensors (Exact FP32)")
     print(f" Initial Size:      {src_size / (1024**3):.2f} GB")
     print(f" Output GGUF Size:  {out_size / (1024**3):.2f} GB ({compression:.1f}% reduction)")
@@ -230,7 +240,7 @@ def main():
     parser = argparse.ArgumentParser(description="Direct SafeTensors -> GGUF Quantizer & LoRA Fuse Engine for juicer.kn")
     parser.add_argument("src", type=str, help="Path to input .safetensors file")
     parser.add_argument("--lora", action="append", default=[], help="Path to LoRA safetensors file, optionally with :strength (e.g. lora.safetensors:1.0)")
-    parser.add_argument("--type", type=str, default="q4_k", choices=["q4_k", "q8_0"], help="Quantization type (default: q4_k)")
+    parser.add_argument("--type", type=str, default="q4_k", choices=["q4_k", "q6_k", "q8_0"], help="Quantization type (default: q4_k)")
     parser.add_argument("--out", type=str, required=True, help="Path to output .gguf file")
     args = parser.parse_args()
 

@@ -13,6 +13,7 @@
 //   [9/11] Native Q8_0 Block Quantization & SNR Invariant (SNR > 35 dB)
 //   [10/11] Native Q4_0 Block Quantization & SNR Invariant (SNR > 20 dB)
 //   [11/11] SafeTensors Zero-Copy DMA Header Parser & Weight Decoder
+//   [12/12] Native Q2_K Super-Block Quantization, Exact Decode & SNR Invariant
 // ============================================================================
 
 use std::runtime
@@ -20,7 +21,7 @@ use std::text
 
 pub fn run_prove_battery() -> Int with Unsafe:
     println("================================================================================")
-    println(" juicer.kn — Unified Formal In-Memory Prove Battery (11 Instruments)")
+    println(" juicer.kn — Unified Formal In-Memory Prove Battery (12 Instruments)")
     println("================================================================================")
 
     var failed: Int = 0
@@ -207,19 +208,19 @@ pub fn run_prove_battery() -> Int with Unsafe:
 
     // [11/11] SafeTensors Zero-Copy DMA Header Parser & Direct GGUF Quantizer
     print("[11/11] SafeTensors DMA Header & Direct GGUF Quantizer ... ")
-    let json_text: String = "{\"blocks.0.attn.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[4,8],\"data_offsets\":[0,64]}}"
+    let json_text: String = "{\"blocks.0.attn.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[32,32],\"data_offsets\":[0,2048]}}"
     let j_bytes: Array<Int> = bytes_of_str(json_text)
     let j_len: Int = len(j_bytes)
-    let total_file_len: Int = 8 + j_len + 64
+    let total_file_len: Int = 8 + j_len + 2048
     let st_test_buf: ptr<Byte> = alloc_zeroed(total_file_len + 32, "Byte")
     write_u64_le(st_test_buf, 0, j_len)
     var ji: Int = 0
     while ji < j_len:
         bstore(st_test_buf, 8 + ji, j_bytes[ji])
         ji = ji + 1
-    // Write 32 BF16 floats of 1.0 (0x3F80)
+    // Write 1024 BF16 floats of 1.0 (0x3F80)
     var wi: Int = 0
-    while wi < 32:
+    while wi < 1024:
         bstore(st_test_buf, 8 + j_len + wi * 2, 128)
         bstore(st_test_buf, 8 + j_len + wi * 2 + 1, 63)
         wi = wi + 1
@@ -257,9 +258,58 @@ pub fn run_prove_battery() -> Int with Unsafe:
         println("FAIL (tensor_count=" + str(st_model.tensor_count) + ", sz=" + str(st_model.tensors[0].size_bytes) + ", dt=" + st_model.tensors[0].dtype + ", n_floats=" + str(len(s_floats)) + ")")
         failed = failed + 1
 
+    // [12/12] Native Q2_K Super-Block Quantization: exact hand-fixture + SNR invariant
+    print("[12/12] Native Q2_K Quantization & Exact Decode ... ")
+    // Hand fixture: d=1.0, dmin=0, all sc=1/m=0, all qs=0x55 (q=1) -> 256 exact ones
+    let q2_raw: ptr<Byte> = alloc_zeroed(84 + 32, "Byte")
+    var q2f: Int = 0
+    while q2f < 16:
+        bstore(q2_raw, q2f, 1)
+        q2f = q2f + 1
+    var q2q: Int = 0
+    while q2q < 64:
+        bstore(q2_raw, 16 + q2q, 85)
+        q2q = q2q + 1
+    write_u16_le(q2_raw, 80, 15360) // fp16(1.0) = 0x3C00
+    write_u16_le(q2_raw, 82, 0)
+    let q2_dec: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    dequantize_q2_k(q2_raw, 0, 1, q2_dec, 0)
+    var q2_exact_bad: Int = 0
+    var q2e: Int = 0
+    while q2e < 256:
+        let dv: Float = mem_load(ptr_offset(q2_dec, q2e, "Float"), "Float")
+        var dd: Float = dv - 1.0
+        if dd < 0.0:
+            dd = 0.0 - dd
+        if dd > 0.000001:
+            q2_exact_bad = q2_exact_bad + 1
+        q2e = q2e + 1
+    decay q2_raw
+    decay q2_dec
+    // Sine SNR through the MSE encoder
+    let q2_in: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    let q2_out: ptr<Byte> = alloc_zeroed(84 + 32, "Byte")
+    let q2_recon: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    var q2i: Int = 0
+    while q2i < 256:
+        let val: Float = math_sin((q2i as Float) * 0.05) * 5.0
+        mem_store(ptr_offset(q2_in, q2i, "Float"), val, "Float")
+        q2i = q2i + 1
+    quantize_superblock_q2_k(q2_in, 0, q2_out, 0)
+    dequantize_q2_k(q2_out, 0, 1, q2_recon, 0)
+    let snr_q2: Float = compute_quantization_snr(q2_in, q2_recon, 256)
+    decay q2_in
+    decay q2_out
+    decay q2_recon
+    if q2_exact_bad == 0 and snr_q2 > 10.0:
+        println("PASS (exact=256/256 ones, SNR=" + format_1dp(snr_q2) + " dB > 10 dB)")
+    else:
+        println("FAIL (exact_bad=" + str(q2_exact_bad) + ", SNR=" + format_1dp(snr_q2) + " dB)")
+        failed = failed + 1
+
     println("================================================================================")
     if failed == 0:
-        println(" ALL 11 PROVE BATTERIES VERIFIED PASS (100% IN-MEMORY INTEGRITY)!")
+        println(" ALL 12 PROVE BATTERIES VERIFIED PASS (100% IN-MEMORY INTEGRITY)!")
         println("================================================================================")
         return EXIT_OK
     else:

@@ -512,6 +512,33 @@ pub fn read_block_weight_sample(h: ptr<Void>, model: GgufModel, block_idx: Int, 
                     push(sample, d_f * ((q1 - 8) as Float))
                 qi = qi + 1
             sbi = sbi + 1
+    elif ttype == 10:
+        // Q2_K exact (84 bytes per 256 weights: scales[16] + qs[64] + d + dmin)
+        let num_sb: Int = r_act / 84
+        var sbi: Int = 0
+        while sbi < num_sb and len(sample) < max_floats:
+            let sb_off: Int = sbi * 84
+            let d_u16: Int = read_u16_le(raw_buf, sb_off + 80)
+            let dmin_u16: Int = read_u16_le(raw_buf, sb_off + 82)
+            let d_f: Float = fp16_to_fp32(d_u16)
+            let dmin_f: Float = fp16_to_fp32(dmin_u16)
+            var j: Int = 0
+            while j < 16 and len(sample) < max_floats:
+                let sc_b: Int = bref(raw_buf, sb_off + j)
+                let step: Float = d_f * ((sc_b & 15) as Float)
+                let neg_m: Float = dmin_f * (((sc_b >> 4) & 15) as Float)
+                let g: Int = j / 8
+                let m: Int = j % 8
+                let hseg: Int = (m % 2) * 16
+                let shift: Int = (m / 2) * 2
+                var w: Int = 0
+                while w < 16 and len(sample) < max_floats:
+                    let bv: Int = bref(raw_buf, sb_off + 16 + g * 32 + hseg + w)
+                    let q: Int = (bv >> shift) & 3
+                    push(sample, step * (q as Float) - neg_m)
+                    w = w + 1
+                j = j + 1
+            sbi = sbi + 1
     else:
         // Generic byte fallback
         var raw_i: Int = 0
@@ -748,6 +775,42 @@ pub fn compute_gguf_block_dense_stats(h: ptr<Void>, model: GgufModel, block_idx:
                                 push(sample_out, f1)
                                 proj_sampled = proj_sampled + 1
                         qi = qi + 1
+                    sbi = sbi + 1
+            elif ttype == 10:
+                // Q2_K exact (84 bytes per 256 weights)
+                let num_sb: Int = r_act / 84
+                var sbi: Int = 0
+                while sbi < num_sb:
+                    let sb_off: Int = sbi * 84
+                    let d_f: Float = fp16_to_fp32(read_u16_le(raw_buf, sb_off + 80))
+                    let dmin_f: Float = fp16_to_fp32(read_u16_le(raw_buf, sb_off + 82))
+                    var j: Int = 0
+                    while j < 16:
+                        let sc_b: Int = bref(raw_buf, sb_off + j)
+                        let step: Float = d_f * ((sc_b & 15) as Float)
+                        let neg_m: Float = dmin_f * (((sc_b >> 4) & 15) as Float)
+                        let g: Int = j / 8
+                        let m: Int = j % 8
+                        let hseg: Int = (m % 2) * 16
+                        let shift: Int = (m / 2) * 2
+                        var w: Int = 0
+                        while w < 16:
+                            let bv: Int = bref(raw_buf, sb_off + 16 + g * 32 + hseg + w)
+                            let q: Int = (bv >> shift) & 3
+                            let fval: Float = step * (q as Float) - neg_m
+                            total_elements = total_elements + 1
+                            sum = sum + fval
+                            let w2: Float = fval * fval
+                            sum_sq = sum_sq + w2
+                            sum_m4 = sum_m4 + (w2 * w2)
+                            let af: Float = math_abs(fval)
+                            if af > max_abs_val: max_abs_val = af
+                            if proj_sampled < target_sample_per_proj:
+                                if len(sample_out) < sample_cap:
+                                    push(sample_out, fval)
+                                    proj_sampled = proj_sampled + 1
+                            w = w + 1
+                        j = j + 1
                     sbi = sbi + 1
         pi = pi + 1
 

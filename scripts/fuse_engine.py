@@ -91,6 +91,44 @@ def quantize_q4_k_gpu(w: torch.Tensor) -> torch.Tensor:
     block_bytes = torch.cat([d_fp16, dmin_fp16, scales_bytes, packed_qs], dim=-1)
     return block_bytes
 
+# GPU Q6_K Quantizer (210 bytes per 256 weights: ql[128] + qh[64] + scales[16] + d[2])
+# Matches ComfyUI-GGUF dequantize_blocks_Q6_K layout exactly:
+#   val = d_fp16 * scale_g(int8) * ((ql_low4 | (qh_high2 << 4)) - 32), 16 groups of 16.
+# Scheme: eff_g = amax_g / 31, d = max(eff_g) / 127, scale_g = round(eff_g / d).
+def quantize_q6_k_gpu(w: torch.Tensor) -> torch.Tensor:
+    orig_shape = w.shape
+    wf = w.float().reshape(-1, 256)
+    n_blocks = wf.shape[0]
+    dev = wf.device
+    # 16 groups of 16 weights per super-block
+    xg = wf.reshape((n_blocks, 16, 16))
+    amax_g = torch.amax(torch.abs(xg), dim=-1)  # (n, 16)
+    eff_g = amax_g / 31.0
+    d = torch.amax(eff_g, dim=-1, keepdim=True) / 127.0  # (n, 1)
+    d = torch.clamp(d, min=1e-8)
+    sc = torch.clamp(torch.round(eff_g / d), 0, 127).to(torch.int8)  # (n, 16)
+    # Effective per-group scale, emulating fp16 rounding of d on dequant side
+    d_fp16_rnd = d.to(torch.float16).float()  # (n, 1)
+    eff_scale = (d_fp16_rnd * sc.float()).unsqueeze(-1)  # (n, 16, 1)
+    # Guard silent groups (scale 0) against div-by-zero: force q = 0 there
+    safe_scale = torch.where(eff_scale == 0, torch.ones_like(eff_scale), eff_scale)
+    q = torch.round(xg / safe_scale)
+    q = torch.where(eff_scale == 0, torch.zeros_like(q), q)
+    q = torch.clamp(q, -32, 31).to(torch.int64) + 32  # 0..63, (n,16,16)
+    q = q.reshape((n_blocks, 8, 32)).to(torch.uint8)  # flat f = g*32+m, matches dequant interleave
+    low4 = (q & 0x0F).to(torch.uint8)   # (n, 8, 32)
+    high2 = ((q >> 4) & 0x03).to(torch.uint8)
+    # ql byte[b,k] (b=0,1; k<64) holds lows at f=b*128+k and f=b*128+64+k
+    low2264 = low4.reshape((n_blocks, 2, 2, 64))
+    ql = (low2264[:, :, 0, :] | (low2264[:, :, 1, :] << 4)).reshape((n_blocks, 128))
+    # qh byte[c,k2] (c=0,1; k2<32) holds highs of f=c*128+t*32+k2, t=0..3
+    qh4 = high2.reshape((n_blocks, 2, 4, 32))
+    qh = (qh4[:, :, 0, :] | (qh4[:, :, 1, :] << 2) | (qh4[:, :, 2, :] << 4) | (qh4[:, :, 3, :] << 6)).reshape((n_blocks, 64))
+    scales_u8 = sc.view(torch.uint8)  # (n, 16)
+    d_fp16 = d.to(torch.float16).view(torch.uint8).reshape((n_blocks, 2))
+    block_bytes = torch.cat([ql, qh, scales_u8, d_fp16], dim=-1)  # (n, 210)
+    return block_bytes
+
 def get_block_id(name: str) -> int:
     # NOTE: single_blocks.<i> maps to 1000+i to match the Kain-side convention
     # (slicer.kn / gguf_parser.kn), so --drop ids mean the same thing in

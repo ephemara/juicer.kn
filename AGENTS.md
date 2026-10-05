@@ -507,6 +507,10 @@ and is proven with `jc gpu-probe` / `jc gpu-fuse-test` — never in a new Python
   Pack explicitly with `f32_to_bits` / `write_f32_le` / `gpu_pack_f32`, unpack with
   `f32_from_bits` / `read_f32_le`. (Native `quantize.kn` math is safe: it is f64-
   consistent end to end, with byte-exact codecs only at container boundaries.)
+- **Never read-modify-write the same byte across loop iterations.** The optimizer
+  mishandles `bref`→OR→`bstore` to one address from successive iterations (bytes read
+  back zero). Accumulate each output byte in a local and store it exactly once. (Proven
+  the hard way in the Q2_K nibble packer; the single-store-per-byte rewrite fixed it.)
 - **Byte load/store semantics (exact).**
   - Read byte `i` as `Int`: `mem_load(ptr_offset(buf, i, "Byte"), "Int") & 255`
     (**not** `mem_load "Byte" as Int` — that reinterprets the 8-byte word).
@@ -632,6 +636,23 @@ Sliced 16/20/24-block Wan 2.1 GGUFs have rendered through ComfyUI end-to-end.
 per-block weight samples (§1), but verdict thresholds are unvalidated hunches tuned on
 synthetic fixtures. There is currently **no render-tested evidence** that any specific
 Wan block is removable — lens output nominates, rendering decides.
+
+### RECEIPT 2026-10-05: the floor is Q2_K and it renders (Flux Klein 9B)
+
+`jc quantize --type q2_k` squeezed the 16.91 GB BF16 master to a **2.78 GB Q2_K GGUF**
+(120 tensors, 100% native Kain, no Python). Q2_K (2 bits) is the floor of *loadable*
+GGUF — Q1 does not exist as a runnable format (2 bits x 9B params = 2.25 GB hard floor
++ 1D floats). Loaded in ComfyUI via ComfyUI-GGUF and **rendered end-to-end using the
+Qwen text encoder** (T5+CLIP pairing fails Klein's conditioning dims: 512x4096 vs
+12288x4096 — Klein wants Qwen/Gemma-family encoders). Quality is exactly what 2-bit
+predicts: coherent, degraded, unmistakably alive. At ~3 GB the 9B model is the first
+one in this repo that can sit **fully resident in 6 GB VRAM** — the PCIe-thrash thesis
+finally applies to a big model on this card.
+
+Container-validity rule learned the hard way: quantized tensors require
+**stored-dim0 % block-size == 0** (gguf-py reverses dims, so its shape[-1] check lands
+on stored dim0: st.dim{n-1} on the safetensors path, dim0 on the GGUF path). One
+128-wide tensor produced a file our own parser accepted but gguf-py/ComfyUI rejected.
 
 ### The honest ceiling on this box (Quadro RTX 3000 Mobile, 6 GB)
 

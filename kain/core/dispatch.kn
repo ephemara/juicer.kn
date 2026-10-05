@@ -37,11 +37,11 @@ fn print_usage():
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
-    println("  quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q8_0] --out <out.gguf>")
+    println("  quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q6_k|q8_0|q4_0|q2_k] --out <out.gguf>")
     println("                                         Native GGUF block re-quantizer & lossless LoRA fusion engine")
     println("  schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
-    println("  prove                                  Run 11-point in-memory formal verification battery")
+    println("  prove                                  Run 12-point in-memory formal verification battery")
     println("  gpu-probe                              Verify native CUDA driver bridge (context/VRAM/Kain-PTX JIT)")
     println("  gpu-fuse-test                          Prove on-device FuseLoRA numerics vs CPU reference GEMM")
     println("  help                                   Show this handbook\n")
@@ -474,7 +474,7 @@ fn main() -> Int with Unsafe:
 
     if cmd == "quantize":
         if len(args) < 2:
-            println("error: quantize requires a model path. usage: juicer quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q8_0|q4_0] --out <quant.gguf>")
+            println("error: quantize requires a model path. usage: juicer quantize <model.gguf|.safetensors> [--lora <path>] [--type q4_k|q6_k|q8_0|q4_0|q2_k] --out <quant.gguf>")
             return EXIT_ERROR
         let model_path: String = args[1]
         var target_type: String = "q4_k"
@@ -498,7 +498,7 @@ fn main() -> Int with Unsafe:
             // If target_type is q4_0, q8_0, or default, and no --lora adapter is specified,
             // execute 100% native Pure Kain Direct SafeTensors -> GGUF quantizer.
             // If CUDA Q4_K or LoRA baking is requested, route to the Python Tensor-Core engine.
-            if len(lora_args_cmd) == 0 and (target_type == "q4_0" or target_type == "q8_0" or target_type == "q4"):
+            if len(lora_args_cmd) == 0 and (target_type == "q4_0" or target_type == "q8_0" or target_type == "q4" or target_type == "q2_k" or target_type == "q2"):
                 let st_model: SafetensorsModel = parse_safetensors_model(model_path)
                 if st_model.file_size <= 0:
                     println("quantize: failed to load SafeTensors model " + model_path)
