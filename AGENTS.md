@@ -288,6 +288,19 @@ edit, reformat, or add to it. If the baseline needs updating, update both copies
   plus `_llm_proto_examples/` (tokenizers, embeddings, transformer kernels),
   `_gpu_cpu_examples/`, `_shader_examples/`, `training/kain_omni.kn` (one compilable file
   exercising every layer L0–L7 — the single best teacher in the corpus).
+- **GPU shelf (read BEFORE writing any GPU code — this is the pattern library for
+  `kain/gpu/` + `gpu_bridge.kn` work):** `SHADER_GPU.MD` (full reference: shader
+  authoring, `comptime` plans, host `dispatch`, PTX/SPIR-V/HLSL backends, `std::cuda`
+  bridge, `gpu-artifacts` CLI, validation ladder) + `docs/kain/_shader_examples/`
+  (`gpu_showcase.kn`, `ocean.kn`, `blackhole.kn`, `supermotion_v2.kn` — compilable
+  shader-authoring molds) + `docs/kain/_gpu_cpu_examples/` (`gpu_cpu_pipeline.kn`,
+  `fusion_chain.kn`, `orchestrate_god.kn` — host+device dispatch + residency patterns)
+  + `docs/kain/_llm_proto_examples/` (full LLM in Kain: `transformer_kernel.kn`,
+  `embedding.kn`, `tokenizer.kn`, `training_kernel.kn` — the closest existing art to
+  quantize/dequant GEMM placement on-device). Grep `stdlib.kn` for the exact
+  `std::cuda` / `std::gpu` symbol bodies (`cuda_shfl_*`, `cuda_require_tensor_cores`,
+  `gpu_pipeline_library_create`, ...). Vendor content is read-only — copy the pattern
+  into `kain/gpu/`, never edit `docs/kain/`.
 - **`THE_MESSIAH.KN` — the ultra file:** ~6,029 modules, ~795,000 lines, ~36 MB of raw
   Kain amalgamation. The ground truth for how Kain is written *at scale*.
   **Never `read` the whole file** — it is a reference corpus, not a dependency, not
