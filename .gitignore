@@ -16,6 +16,13 @@ juicer.exe
 jc.exe
 *.gguf
 
+# GPU codegen output (source lives in kain/gpu/*.kn; regen via scripts/build.py)
+# Output base is .kain/gpu/ (already ignored); these guard against
+# accidental --output into the source dir.
+kain/gpu/artifacts.*
+kain/gpu/fusion.*
+kain/gpu/kain_compute_residency*
+
 # Benchmark / diagnostic artifacts (put anything worth keeping under reports/)
 comfy_server.log
 *.log

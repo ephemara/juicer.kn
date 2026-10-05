@@ -14,6 +14,14 @@ echo ===========================================================================
 echo  juicer.kn — Build Pipeline
 echo ================================================================================
 
+echo [0/3] Regenerating GPU artifacts kain/gpu/fusion_kernel.kn -^> .kain/gpu/ ...
+if not exist ".kain\gpu" mkdir ".kain\gpu"
+%KAIN_BIN% gpu-artifacts kain/gpu/fusion_kernel.kn --target cuda --no-residency --output .kain/gpu/fusion
+if %errorlevel% neq 0 (
+    echo [ERROR] GPU artifact generation failed.
+    exit /b %errorlevel%
+)
+
 echo [1/3] Amalgamating kain/core/*.kn -^> kain/juicer.kn ...
 %KAIN_BIN% amalgamate --raw kain/core -o kain/juicer.kn
 if %errorlevel% neq 0 (

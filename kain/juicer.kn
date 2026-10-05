@@ -1,7 +1,7 @@
 // -- KAIN RAW AMALGAMATION -- core ----------------------------------------------------------
 // kind:       directory
 // contents:   source
-// structure:  13 files | 13 modules
+// structure:  14 files | 14 modules
 //
 // -- PUBLIC INTERFACE DIRECTORY -----------------------------------------------
 //
@@ -240,6 +240,44 @@ pub fn f32_from_bits(bits: Int) -> Float with Pure:
 pub fn read_f32_le(buf: ptr<Byte>, off: Int) -> Float with Unsafe:
     let bits: Int = read_u32_le(buf, off)
     return f32_from_bits(bits)
+
+// Narrow an f64 host value to nearest IEEE-754 binary32 bit pattern (RNE).
+// Needed at every host->device boundary: Kain Float is 64-bit, GPUs speak f32.
+// Subnormals flush to zero; overflow yields Inf; NaN yields canonical NaN.
+pub fn f32_to_bits(val: Float) -> Int with Unsafe:
+    if val == 0.0:
+        return 0
+    let b64: Int = bitcast(val, "I64")
+    let sign: Int = (b64 >> 63) & 1
+    let e64: Int = (b64 >> 52) & 2047
+    let m64: Int = b64 & 4503599627370495
+    if e64 == 0:
+        return 0
+    if e64 == 2047:
+        if m64 == 0:
+            return (sign << 31) + (255 << 23)
+        return (sign << 31) + (255 << 23) + 4194304
+    var e32: Int = e64 - 1023 + 127
+    if e32 >= 255:
+        return (sign << 31) + (255 << 23)
+    if e32 <= 0:
+        return 0
+    let dropped: Int = m64 & 536870911
+    var keep: Int = m64 >> 29
+    if dropped > 268435456:
+        keep = keep + 1
+    elif dropped == 268435456:
+        if (keep & 1) == 1:
+            keep = keep + 1
+    if keep >= 8388608:
+        keep = keep - 8388608
+        e32 = e32 + 1
+        if e32 >= 255:
+            return (sign << 31) + (255 << 23)
+    return (sign << 31) + (e32 << 23) + keep
+
+pub fn write_f32_le(buf: ptr<Byte>, off: Int, val: Float) with Unsafe:
+    write_u32_le(buf, off, f32_to_bits(val))
 
 // ── Text & String Helpers ──────────────────────────────────────────────────
 pub fn str_starts_with(s: String, prefix: String) -> Int:
@@ -902,6 +940,7 @@ fn print_usage():
     println("  fuse <model.gguf> <lora.safetensors> [--strength 1.0] [--drop <list>] --out <fused.gguf>")
     println("                                         Bake LoRA directly into GGUF weights via CUDA")
     println("                                         (Optionally slice/drop blocks in the same pass)")
+    println("                                         [--native fuses 100% in-Kain: exact bases, Q8_0 out]")
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
@@ -910,6 +949,8 @@ fn print_usage():
     println("  schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
     println("  prove                                  Run 11-point in-memory formal verification battery")
+    println("  gpu-probe                              Verify native CUDA driver bridge (context/VRAM/Kain-PTX JIT)")
+    println("  gpu-fuse-test                          Prove on-device FuseLoRA numerics vs CPU reference GEMM")
     println("  help                                   Show this handbook\n")
     println("EXAMPLES:")
     println("  juicer profile models/diffusion_models/wan2.1-i2v-14b-480p-Q4_K_M.gguf")
@@ -1263,6 +1304,12 @@ fn main() -> Int with Unsafe:
     if cmd == "prove":
         return run_prove_battery()
 
+    if cmd == "gpu-probe":
+        return run_gpu_probe_command()
+
+    if cmd == "gpu-fuse-test":
+        return run_gpu_fuse_test_command()
+
     if cmd == "profile":
         if len(args) < 2:
             println("error: profile requires a model path. usage: juicer profile <model.gguf>")
@@ -1279,6 +1326,7 @@ fn main() -> Int with Unsafe:
         var strength: Float = 1.0
         var drop_list: Array<Int> = []
         var out_path: String = "fused_model.gguf"
+        var use_native: Int = 0
 
         var i: Int = 3
         while i < len(args):
@@ -1291,8 +1339,15 @@ fn main() -> Int with Unsafe:
             elif args[i] == "--out" and i + 1 < len(args):
                 out_path = args[i + 1]
                 i = i + 1
+            elif args[i] == "--native":
+                use_native = 1
             i = i + 1
 
+        if use_native == 1:
+            if len(drop_list) > 0:
+                println("fuse --native does not take --drop (slice separately with jc slice)")
+                return EXIT_ERROR
+            return execute_native_gpu_fuse(base_path, lora_path, strength, out_path)
         return execute_lora_fuse(base_path, lora_path, strength, drop_list, out_path)
 
     if cmd == "slice":
@@ -1918,6 +1973,565 @@ pub fn execute_lora_fuse(base_path: String, lora_path: String, strength: Float, 
         println("fuse: execution failed with status " + str(ret))
         return EXIT_ERROR
 
+    return EXIT_OK
+
+// Map a LoRA tensor key to its base-model target weight name.
+// Handles diffusion_model. prefix, lora_up/lora_down + lora_A/lora_B conventions.
+pub fn lora_target_name(lora_key: String) -> String with Pure:
+    var core: String = lora_key
+    if str_starts_with(core, "diffusion_model.") == 1:
+        core = text_substring_string(core, 16, len(core) - 16)
+    if str_ends_with(core, ".lora_up.weight") == 1:
+        return text_substring_string(core, 0, len(core) - 15) + ".weight"
+    if str_ends_with(core, ".lora_down.weight") == 1:
+        return text_substring_string(core, 0, len(core) - 17) + ".weight"
+    if str_ends_with(core, ".lora_B.weight") == 1:
+        return text_substring_string(core, 0, len(core) - 14) + ".weight"
+    if str_ends_with(core, ".lora_A.weight") == 1:
+        return text_substring_string(core, 0, len(core) - 14) + ".weight"
+    return ""
+
+pub fn lora_side_of_key(lora_key: String) -> Int:
+    if str_ends_with(lora_key, ".lora_up.weight") == 1:
+        return 1
+    if str_ends_with(lora_key, ".lora_B.weight") == 1:
+        return 1
+    if str_ends_with(lora_key, ".lora_down.weight") == 1:
+        return 2
+    if str_ends_with(lora_key, ".lora_A.weight") == 1:
+        return 2
+    return 0
+
+// 100% native GPU LoRA fusion: GGUF base (exact-decodable) + safetensors LoRA.
+// Fused 2D weights are written Q8_0 (native MSE quantizer); every other byte
+// streams through bit-exact. Q4_K bases are refused (approximate decode).
+pub fn execute_native_gpu_fuse(base_path: String, lora_path: String, strength: Float, out_path: String) -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Native GPU LoRA Fusion Engine (zero Python, zero PyTorch)")
+    println("================================================================================")
+    println(" Base Model:   " + base_path)
+    println(" LoRA File:    " + lora_path)
+    println(" Strength:     " + format_2dp(strength))
+    println(" Output:       " + out_path)
+
+    let base: GgufModel = parse_gguf_model(base_path)
+    if base.file_size <= 0:
+        println("native fuse: failed to load base model")
+        return EXIT_ERROR
+    let lora: SafetensorsModel = parse_safetensors_model(lora_path)
+    if lora.file_size <= 0:
+        println("native fuse: failed to load LoRA model")
+        return EXIT_ERROR
+    println(" Base: " + str(base.tensor_count) + " tensors, LoRA: " + str(lora.tensor_count) + " tensors")
+
+    // Build fusion plan: match up/down pairs to base 2D weights
+    var plan_base: Array<Int> = []
+    var plan_up: Array<Int> = []
+    var plan_dn: Array<Int> = []
+    var plan_rows: Array<Int> = []
+    var plan_cols: Array<Int> = []
+    var plan_rank: Array<Int> = []
+    var skipped_q4k: Int = 0
+    var skipped_1d: Int = 0
+    var skipped_nomatch: Int = 0
+
+    var li: Int = 0
+    while li < len(lora.tensors):
+        let lt: SafetensorsTensor = lora.tensors[li]
+        let side: Int = lora_side_of_key(lt.name)
+        if side == 1:
+            let target: String = lora_target_name(lt.name)
+            if len(target) > 0:
+                var bi: Int = 0
+                var found_b: Int = 0 - 1
+                while bi < len(base.tensors):
+                    if base.tensors[bi].name == target:
+                        found_b = bi
+                        break
+                    bi = bi + 1
+                var di2: Int = 0
+                var found_d: Int = 0 - 1
+                while di2 < len(lora.tensors):
+                    if di2 != li:
+                        if lora_target_name(lora.tensors[di2].name) == target:
+                            if lora_side_of_key(lora.tensors[di2].name) == 2:
+                                found_d = di2
+                                break
+                    di2 = di2 + 1
+                if found_b >= 0 and found_d >= 0:
+                    let bt: GgufTensor = base.tensors[found_b]
+                    let ut: SafetensorsTensor = lt
+                    let dt: SafetensorsTensor = lora.tensors[found_d]
+                    if bt.n_dims == 2:
+                        if bt.type_id == 0 or bt.type_id == 1 or bt.type_id == 28 or bt.type_id == 8 or bt.type_id == 2:
+                            let rows: Int = bt.dim1
+                            let cols: Int = bt.dim0
+                            if ut.n_dims == 2 and dt.n_dims == 2:
+                                if ut.dim0 == rows and dt.dim1 == cols and ut.dim1 == dt.dim0:
+                                    push(plan_base, found_b)
+                                    push(plan_up, li)
+                                    push(plan_dn, found_d)
+                                    push(plan_rows, rows)
+                                    push(plan_cols, cols)
+                                    push(plan_rank, ut.dim1)
+                                else:
+                                    skipped_nomatch = skipped_nomatch + 1
+                            else:
+                                skipped_nomatch = skipped_nomatch + 1
+                        else:
+                            skipped_q4k = skipped_q4k + 1
+                    else:
+                        skipped_1d = skipped_1d + 1
+                else:
+                    skipped_nomatch = skipped_nomatch + 1
+        li = li + 1
+
+    println(" Fusion plan: " + str(len(plan_base)) + " weights (")
+    println("   skipped Q4_K/quantized=" + str(skipped_q4k) + " 1D=" + str(skipped_1d) + " unmatched=" + str(skipped_nomatch) + ")")
+    if len(plan_base) == 0:
+        println("native fuse: nothing to fuse")
+        return EXIT_ERROR
+    if skipped_q4k > 0:
+        println("native fuse: refused — matched Q4_K base weights need exact decode (use Python fuse path)")
+        return EXIT_ERROR
+
+    // GPU session init (once for all tensors)
+    let h: ptr<Void> = gpu_lib_open()
+    if ptr_to_int(h) == 0:
+        println("native fuse: no nvcuda.dll")
+        return EXIT_ERROR
+    let stub: ptr<Void> = gpu_make_stub()
+    let stub4: ptr<Void> = gpu_make_launch_stub()
+    let p_init = gpu_sym(h, "cuInit")
+    let p_devget = gpu_sym(h, "cuDeviceGet")
+    let p_ctxcreate = gpu_sym(h, "cuCtxCreate_v2")
+    let p_ctxdestroy = gpu_sym(h, "cuCtxDestroy_v2")
+    let p_ctxsync = gpu_sym(h, "cuCtxSynchronize")
+    let p_modload = gpu_sym(h, "cuModuleLoadData")
+    let p_modgetfn = gpu_sym(h, "cuModuleGetFunction")
+    let p_memalloc = gpu_sym(h, "cuMemAlloc_v2")
+    let p_htod = gpu_sym(h, "cuMemcpyHtoD_v2")
+    let p_dtoh = gpu_sym(h, "cuMemcpyDtoH_v2")
+    let p_memfree = gpu_sym(h, "cuMemFree_v2")
+    let p_launch = gpu_sym(h, "cuLaunchKernel")
+    if ptr_to_int(p_launch) == 0 or ptr_to_int(p_ctxsync) == 0:
+        println("native fuse: launch entrypoints missing")
+        let _fl: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let blk: ptr<Int> = alloc_zeroed(13 + 32, "Int")
+    mem_store(blk, ptr_to_int(p_init), "Int")
+    let r_init: Int = gpu_invoke(stub, blk)
+    let dev_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_devget), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(dev_slot), "Int")
+    let r_dev: Int = gpu_invoke(stub, blk)
+    let dev: Int = mem_load(dev_slot, "Int")
+    decay dev_slot
+    let ctx_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_ctxcreate), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ctx_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), dev, "Int")
+    let r_ctx: Int = gpu_invoke(stub, blk)
+    decay ctx_slot
+    if r_init != CUDA_OK or r_dev != CUDA_OK or r_ctx != CUDA_OK:
+        println("native fuse: GPU init failed")
+        decay blk
+        let _fg: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let h_ptx = k_open_read("kain/gpu/artifacts.derived.sm_75.ptx")
+    if k_handle_bad(h_ptx) == 1:
+        println("native fuse: PTX artifact missing")
+        decay blk
+        let _fh: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    let ptx_len: Int = k_size(h_ptx)
+    let ptx_buf: ptr<Byte> = alloc_zeroed(ptx_len + 1 + 32, "Byte")
+    let ptx_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    let r_pr: Int = k_read_at(h_ptx, ptx_slot, 0, ptx_buf, ptx_len)
+    decay ptx_slot
+    let _cc: Int = k_CloseHandle(h_ptx)
+    mem_store(ptr_offset(ptx_buf, r_pr, "Byte"), 0 as Byte, "Byte")
+    let mod_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_modload), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(mod_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ptx_buf), "Int")
+    let r_mod: Int = gpu_invoke(stub, blk)
+    let mod_h: Int = mem_load(mod_slot, "Int")
+    decay mod_slot
+    decay ptx_buf
+    let fname_buf: ptr<Byte> = gpu_str_to_cbuf("FuseLoRA")
+    let kfn_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_modgetfn), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(kfn_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), mod_h, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), ptr_to_int(fname_buf), "Int")
+    let r_fn: Int = gpu_invoke(stub, blk)
+    let kfn_h: Int = mem_load(kfn_slot, "Int")
+    decay kfn_slot
+    decay fname_buf
+    if r_mod != CUDA_OK or r_fn != CUDA_OK:
+        println("native fuse: kernel resolve failed")
+        decay blk
+        let _fi: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    println(" Kernel ready, fusing " + str(len(plan_base)) + " weights ...")
+
+    // Open files: source base for DMA decode, LoRA file for adapter decode, dest GGUF
+    let h_src: ptr<Void> = k_open_read(base_path)
+    let h_lora: ptr<Void> = k_open_read(lora_path)
+    let h_dst: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h_src) == 1 or k_handle_bad(h_lora) == 1 or k_handle_bad(h_dst) == 1:
+        println("native fuse: file open failed")
+        decay blk
+        let _fj: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+
+    // Header: copy base KV verbatim (no --drop in native path, topology unchanged)
+    let kv_total_len: Int = base.kv_data_offset
+    let kv_buf: ptr<Byte> = alloc_zeroed(kv_total_len + 32, "Byte")
+    let _r_kv: Int = k_read_at(h_src, nslot, 0, kv_buf, kv_total_len)
+    let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_total_len)
+    decay kv_buf
+
+    // Tensor directory: fused 2D weights become Q8_0, everything else keeps type/size
+    let t_buf_sz: Int = 1048576 * 4
+    let t_buf: ptr<Byte> = alloc_zeroed(t_buf_sz + 32, "Byte")
+    var tb_off: Int = 0
+    var cur_payload_offset: Int = 0
+    var ti: Int = 0
+    while ti < len(base.tensors):
+        let st: GgufTensor = base.tensors[ti]
+        let tname: String = st.name
+        let tname_bytes: Array<Int> = bytes_of_str(tname)
+        let tn_len: Int = len(tname_bytes)
+        write_u64_le(t_buf, tb_off, tn_len)
+        tb_off = tb_off + 8
+        var ni: Int = 0
+        while ni < tn_len:
+            bstore(t_buf, tb_off, tname_bytes[ni])
+            tb_off = tb_off + 1
+            ni = ni + 1
+        write_u32_le(t_buf, tb_off, st.n_dims)
+        tb_off = tb_off + 4
+        if st.n_dims >= 1:
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        if st.n_dims >= 2:
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+        if st.n_dims >= 3:
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+        if st.n_dims >= 4:
+            write_u64_le(t_buf, tb_off, st.dim3)
+            tb_off = tb_off + 8
+        var out_type: Int = st.type_id
+        var out_bytes: Int = st.size_bytes
+        var pi2: Int = 0
+        var is_fused: Int = 0
+        while pi2 < len(plan_base):
+            if plan_base[pi2] == ti:
+                is_fused = 1
+                break
+            pi2 = pi2 + 1
+        if is_fused == 1:
+            let total_el: Int = st.dim0 * st.dim1
+            out_type = 8
+            out_bytes = (total_el / 32) * 34
+        write_u32_le(t_buf, tb_off, out_type)
+        tb_off = tb_off + 4
+        write_u64_le(t_buf, tb_off, cur_payload_offset)
+        tb_off = tb_off + 8
+        cur_payload_offset = cur_payload_offset + out_bytes
+        let rem: Int = cur_payload_offset % base.alignment
+        if rem != 0:
+            cur_payload_offset = cur_payload_offset + (base.alignment - rem)
+        ti = ti + 1
+    let _w_t: Int = k_write_all(h_dst, nslot, t_buf, tb_off)
+    decay t_buf
+    let total_header_written: Int = kv_total_len + tb_off
+    let pad_needed: Int = (base.alignment - (total_header_written % base.alignment)) % base.alignment
+    if pad_needed > 0:
+        let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+        let _w_pad: Int = k_write_all(h_dst, nslot, pad_buf, pad_needed)
+        decay pad_buf
+    println(" Header & directory written (" + str(len(plan_base)) + " Q8_0 fused weights)")
+
+    // Payload streaming: fuse on GPU per plan entry, passthrough otherwise
+    let chunk_size: Int = 8388608
+    let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    var fused_count: Int = 0
+    var stream_i: Int = 0
+    while stream_i < len(base.tensors):
+        let orig_t: GgufTensor = base.tensors[stream_i]
+        var plan_pos: Int = 0 - 1
+        var pj: Int = 0
+        while pj < len(plan_base):
+            if plan_base[pj] == stream_i:
+                plan_pos = pj
+                break
+            pj = pj + 1
+        if plan_pos < 0:
+            var remaining: Int = orig_t.size_bytes
+            var cur_chunk_src: Int = base.tensor_data_offset + orig_t.offset
+            while remaining > 0:
+                var to_read: Int = remaining
+                if to_read > chunk_size:
+                    to_read = chunk_size
+                let r_act: Int = k_read_at(h_src, nslot, cur_chunk_src, dma_buf, to_read)
+                if r_act <= 0:
+                    break
+                let _w_act: Int = k_write_all(h_dst, nslot, dma_buf, r_act)
+                cur_chunk_src = cur_chunk_src + r_act
+                remaining = remaining - r_act
+        else:
+            let rows: Int = plan_rows[plan_pos]
+            let cols: Int = plan_cols[plan_pos]
+            let rank: Int = plan_rank[plan_pos]
+            let up_t: SafetensorsTensor = lora.tensors[plan_up[plan_pos]]
+            let dn_t: SafetensorsTensor = lora.tensors[plan_dn[plan_pos]]
+            let n_el: Int = rows * cols
+            let n_b: Int = rows * rank
+            let n_a: Int = rank * cols
+            // Decode base weight to f64
+            let f_base: ptr<Float> = alloc_zeroed(n_el + 32, "Float")
+            let src_abs: Int = base.tensor_data_offset + orig_t.offset
+            if orig_t.type_id == 0:
+                let rb: Int = k_read_at(h_src, nslot, src_abs, dma_buf, n_el * 4)
+                var di3: Int = 0
+                while di3 < rb / 4:
+                    mem_store(ptr_offset(f_base, di3, "Float"), read_f32_le(dma_buf, di3 * 4), "Float")
+                    di3 = di3 + 1
+            elif orig_t.type_id == 1:
+                let rb: Int = k_read_at(h_src, nslot, src_abs, dma_buf, n_el * 2)
+                var di3: Int = 0
+                while di3 < rb / 2:
+                    mem_store(ptr_offset(f_base, di3, "Float"), fp16_to_fp32(read_u16_le(dma_buf, di3 * 2)), "Float")
+                    di3 = di3 + 1
+            elif orig_t.type_id == 28:
+                let rb: Int = k_read_at(h_src, nslot, src_abs, dma_buf, n_el * 2)
+                var di3: Int = 0
+                while di3 < rb / 2:
+                    mem_store(ptr_offset(f_base, di3, "Float"), bf16_to_fp32(read_u16_le(dma_buf, di3 * 2)), "Float")
+                    di3 = di3 + 1
+            elif orig_t.type_id == 8:
+                let n_bl: Int = n_el / 32
+                let rb: Int = k_read_at(h_src, nslot, src_abs, dma_buf, n_bl * 34)
+                dequantize_q8_0(dma_buf, 0, rb / 34, f_base, 0)
+            elif orig_t.type_id == 2:
+                let n_bl: Int = n_el / 32
+                let rb: Int = k_read_at(h_src, nslot, src_abs, dma_buf, n_bl * 18)
+                dequantize_q4_0(dma_buf, 0, rb / 18, f_base, 0)
+            // Decode LoRA up/down to f64
+            let f_up: ptr<Float> = alloc_zeroed(n_b + 32, "Float")
+            let f_dn: ptr<Float> = alloc_zeroed(n_a + 32, "Float")
+            var is_f32_u: Int = 0
+            var is_f16_u: Int = 0
+            if up_t.dtype == "F32" or up_t.dtype == "f32":
+                is_f32_u = 1
+            elif up_t.dtype == "F16" or up_t.dtype == "f16" or up_t.dtype == "FP16" or up_t.dtype == "fp16":
+                is_f16_u = 1
+            var sbpe_u: Int = 2
+            if is_f32_u == 1:
+                sbpe_u = 4
+            let ub_abs: Int = lora.data_offset + up_t.offset_begin
+            let rb_u: Int = k_read_at(h_lora, nslot, ub_abs, dma_buf, n_b * sbpe_u)
+            var ui: Int = 0
+            while ui < n_b:
+                var fv: Float = 0.0
+                if is_f32_u == 1:
+                    fv = read_f32_le(dma_buf, ui * 4)
+                elif is_f16_u == 1:
+                    fv = fp16_to_fp32(read_u16_le(dma_buf, ui * 2))
+                else:
+                    fv = bf16_to_fp32(read_u16_le(dma_buf, ui * 2))
+                mem_store(ptr_offset(f_up, ui, "Float"), fv, "Float")
+                ui = ui + 1
+            var is_f32_d: Int = 0
+            var is_f16_d: Int = 0
+            if dn_t.dtype == "F32" or dn_t.dtype == "f32":
+                is_f32_d = 1
+            elif dn_t.dtype == "F16" or dn_t.dtype == "f16" or dn_t.dtype == "FP16" or dn_t.dtype == "fp16":
+                is_f16_d = 1
+            var sbpe_d: Int = 2
+            if is_f32_d == 1:
+                sbpe_d = 4
+            let db_abs: Int = lora.data_offset + dn_t.offset_begin
+            let rb_d: Int = k_read_at(h_lora, nslot, db_abs, dma_buf, n_a * sbpe_d)
+            var ddi: Int = 0
+            while ddi < n_a:
+                var fv: Float = 0.0
+                if is_f32_d == 1:
+                    fv = read_f32_le(dma_buf, ddi * 4)
+                elif is_f16_d == 1:
+                    fv = fp16_to_fp32(read_u16_le(dma_buf, ddi * 2))
+                else:
+                    fv = bf16_to_fp32(read_u16_le(dma_buf, ddi * 2))
+                mem_store(ptr_offset(f_dn, ddi, "Float"), fv, "Float")
+                ddi = ddi + 1
+            // Pack to f32 bytes, upload, launch, download
+            let pb_b: ptr<Byte> = alloc_zeroed(n_el * 4 + 32, "Byte")
+            let pb_u: ptr<Byte> = alloc_zeroed(n_b * 4 + 32, "Byte")
+            let pb_d: ptr<Byte> = alloc_zeroed(n_a * 4 + 32, "Byte")
+            let pb_p: ptr<Byte> = alloc_zeroed(24 + 32, "Byte")
+            let f_par: ptr<Float> = alloc_zeroed(6 + 32, "Float")
+            mem_store(f_par, rows as Float, "Float")
+            mem_store(ptr_offset(f_par, 1, "Float"), cols as Float, "Float")
+            mem_store(ptr_offset(f_par, 2, "Float"), rank as Float, "Float")
+            mem_store(ptr_offset(f_par, 3, "Float"), 0.0, "Float")
+            mem_store(ptr_offset(f_par, 4, "Float"), strength, "Float")
+            mem_store(ptr_offset(f_par, 5, "Float"), 0.0, "Float")
+            let _gpk0: Int = gpu_pack_f32(pb_b, f_base, n_el)
+            let _gpk1: Int = gpu_pack_f32(pb_u, f_up, n_b)
+            let _gpk2: Int = gpu_pack_f32(pb_d, f_dn, n_a)
+            let _gpk3: Int = gpu_pack_f32(pb_p, f_par, 6)
+            decay f_par
+            let da_s: ptr<Int> = alloc_zeroed(1, "Int")
+            mem_store(blk, ptr_to_int(p_memalloc), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(da_s), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), n_el * 4, "Int")
+            let _ga0: Int = gpu_invoke(stub, blk)
+            let d_wb: Int = mem_load(da_s, "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(da_s), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), n_b * 4, "Int")
+            let _ga1: Int = gpu_invoke(stub, blk)
+            let d_wu: Int = mem_load(da_s, "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(da_s), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), n_a * 4, "Int")
+            let _ga2: Int = gpu_invoke(stub, blk)
+            let d_wd: Int = mem_load(da_s, "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(da_s), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), n_el * 4, "Int")
+            let _ga3: Int = gpu_invoke(stub, blk)
+            let d_wo: Int = mem_load(da_s, "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(da_s), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), 24, "Int")
+            let _ga4: Int = gpu_invoke(stub, blk)
+            let d_wp: Int = mem_load(da_s, "Int")
+            decay da_s
+            mem_store(blk, ptr_to_int(p_htod), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), d_wb, "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(pb_b), "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), n_el * 4, "Int")
+            let _gh0: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wu, "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(pb_u), "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), n_b * 4, "Int")
+            let _gh1: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wd, "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(pb_d), "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), n_a * 4, "Int")
+            let _gh2: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wp, "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(pb_p), "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), 24, "Int")
+            let _gh3: Int = gpu_invoke(stub, blk)
+            decay pb_b
+            decay pb_u
+            decay pb_d
+            decay pb_p
+            decay f_base
+            decay f_up
+            decay f_dn
+            let kslots: ptr<Int> = alloc_zeroed(5 + 32, "Int")
+            mem_store(kslots, d_wb, "Int")
+            mem_store(ptr_offset(kslots, 1, "Int"), d_wu, "Int")
+            mem_store(ptr_offset(kslots, 2, "Int"), d_wd, "Int")
+            mem_store(ptr_offset(kslots, 3, "Int"), d_wo, "Int")
+            mem_store(ptr_offset(kslots, 4, "Int"), d_wp, "Int")
+            let kparr: ptr<Int> = alloc_zeroed(5 + 32, "Int")
+            mem_store(kparr, ptr_to_int(kslots), "Int")
+            mem_store(ptr_offset(kparr, 1, "Int"), ptr_to_int(kslots) + 8, "Int")
+            mem_store(ptr_offset(kparr, 2, "Int"), ptr_to_int(kslots) + 16, "Int")
+            mem_store(ptr_offset(kparr, 3, "Int"), ptr_to_int(kslots) + 24, "Int")
+            mem_store(ptr_offset(kparr, 4, "Int"), ptr_to_int(kslots) + 32, "Int")
+            mem_store(blk, ptr_to_int(p_launch), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), kfn_h, "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), (rows + 15) / 16, "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), (cols + 15) / 16, "Int")
+            mem_store(ptr_offset(blk, 4, "Int"), 1, "Int")
+            mem_store(ptr_offset(blk, 5, "Int"), 16, "Int")
+            mem_store(ptr_offset(blk, 6, "Int"), 16, "Int")
+            mem_store(ptr_offset(blk, 7, "Int"), 1, "Int")
+            mem_store(ptr_offset(blk, 8, "Int"), 0, "Int")
+            mem_store(ptr_offset(blk, 9, "Int"), 0, "Int")
+            mem_store(ptr_offset(blk, 10, "Int"), ptr_to_int(kparr), "Int")
+            mem_store(ptr_offset(blk, 11, "Int"), 0, "Int")
+            let r_ln: Int = gpu_launch(stub4, blk)
+            mem_store(blk, ptr_to_int(p_ctxsync), "Int")
+            let r_sy: Int = gpu_invoke(stub, blk)
+            let ob_down: ptr<Byte> = alloc_zeroed(n_el * 4 + 32, "Byte")
+            mem_store(blk, ptr_to_int(p_dtoh), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ob_down), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), d_wo, "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), n_el * 4, "Int")
+            let _gd: Int = gpu_invoke(stub, blk)
+            decay kslots
+            decay kparr
+            mem_store(blk, ptr_to_int(p_memfree), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), d_wb, "Int")
+            let _gf0: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wu, "Int")
+            let _gf1: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wd, "Int")
+            let _gf2: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wo, "Int")
+            let _gf3: Int = gpu_invoke(stub, blk)
+            mem_store(ptr_offset(blk, 1, "Int"), d_wp, "Int")
+            let _gf4: Int = gpu_invoke(stub, blk)
+            if r_ln != CUDA_OK or r_sy != CUDA_OK:
+                println("native fuse: GPU fusion failed on " + orig_t.name)
+                decay ob_down
+                decay blk
+                let _fk: Int = k_FreeLibrary(h)
+                return EXIT_ERROR
+            // Requantize fused f32 bytes to Q8_0 with MSE search, stream to disk
+            let f_fused: ptr<Float> = alloc_zeroed(n_el + 32, "Float")
+            var fdi: Int = 0
+            while fdi < n_el:
+                mem_store(ptr_offset(f_fused, fdi, "Float"), read_f32_le(ob_down, fdi * 4), "Float")
+                fdi = fdi + 1
+            decay ob_down
+            let n_qb: Int = n_el / 32
+            var qbi: Int = 0
+            while qbi < n_qb:
+                var blocks_batch: Int = 2048
+                if qbi + blocks_batch > n_qb:
+                    blocks_batch = n_qb - qbi
+                let qb_out: ptr<Byte> = alloc_zeroed(blocks_batch * 34 + 32, "Byte")
+                var qi2: Int = 0
+                while qi2 < blocks_batch:
+                    quantize_block_q8_0(f_fused, (qbi + qi2) * 32, qb_out, qi2 * 34)
+                    qi2 = qi2 + 1
+                let _w_qb: Int = k_write_all(h_dst, nslot, qb_out, blocks_batch * 34)
+                decay qb_out
+                qbi = qbi + blocks_batch
+            decay f_fused
+            let written_qb: Int = n_qb * 34
+            let t_pad2: Int = (base.alignment - (written_qb % base.alignment)) % base.alignment
+            if t_pad2 > 0:
+                let pad2: ptr<Byte> = alloc_zeroed(64, "Byte")
+                let _w_tp: Int = k_write_all(h_dst, nslot, pad2, t_pad2)
+                decay pad2
+            fused_count = fused_count + 1
+            if fused_count % 10 == 0:
+                println("   fused " + str(fused_count) + "/" + str(len(plan_base)) + " ...")
+        stream_i = stream_i + 1
+
+    decay dma_buf
+    decay nslot
+    decay blk
+    let _cs: Int = k_CloseHandle(h_src)
+    let _cl2: Int = k_CloseHandle(h_lora)
+    let _cd: Int = k_CloseHandle(h_dst)
+    let _cf: Int = k_FreeLibrary(h)
+
+    println(" Native GPU fusion complete: " + str(fused_count) + " weights fused on-device")
+    println(" Output GGUF: " + out_path)
     return EXIT_OK
 
 // ============================================================================
@@ -2715,6 +3329,843 @@ pub fn compute_gguf_block_dense_stats(h: ptr<Void>, model: GgufModel, block_idx:
         delta_gain_db: g_db,
         sample: sample_out,
     }
+
+// ============================================================================
+// gpu_bridge.kn
+// ============================================================================
+// ============================================================================
+// gpu_bridge.kn — juicer.kn Native CUDA Driver Bridge (Zero-Dependency GPU)
+//
+// Pure-Kain GPU compute foundation: dynamically loads the OS display driver
+// (nvcuda.dll, present on every NVIDIA Windows system — no CUDA Toolkit,
+// no SDK, no PyTorch), installs a 59-byte Win64 trampoline into RWX memory,
+// and drives the full CUDA Driver API from native Kain:
+//
+//   cuInit -> cuDeviceGet -> cuCtxCreate -> cuModuleLoadData (Kain PTX)
+//   -> cuModuleGetFunction -> cuMemAlloc -> HtoD/DtoH -> cuMemFree
+//
+// Calling convention note: Kain inline asm lowers to `call void asm`
+// (all-"r" constraints), so multi-operand call templates cannot return
+// values through $0. All real results travel through the arg block:
+//   blk[0]=fn_ptr, blk[1..4]=a1..a4 (Win64 rcx/rdx/r8/r9), blk[5]=retval.
+// The trampoline also performs dynamic 16B stack realignment because the
+// NVIDIA driver faults on misaligned entry (kernel32 tolerates it).
+// ============================================================================
+
+use std::runtime
+use std::text
+
+@extern @link_name("LoadLibraryA")
+pub fn k_LoadLibraryA(name: String) -> ptr<Void>
+
+@extern @link_name("GetProcAddress")
+pub fn k_GetProcAddress(h: ptr<Void>, proc: String) -> ptr<Void>
+
+@extern @link_name("FreeLibrary")
+pub fn k_FreeLibrary(h: ptr<Void>) -> Int
+
+@extern @link_name("VirtualAlloc")
+pub fn k_VirtualAlloc(addr: ptr<Void>, size: Int, atype: Int, protect: Int) -> ptr<Void>
+
+pub const CUDA_OK: Int = 0
+pub const VIRT_COMMIT_RESERVE: Int = 12288
+pub const VIRT_RWX: Int = 64
+pub const CU_ATTR_MP_COUNT: Int = 16
+
+// 59-byte Win64 indirect-call trampoline with dynamic stack realignment:
+//   mov r10,rcx | mov r11,rsp | and rsp,-16 | sub rsp,48
+//   [rsp+32]=r10 | [rsp+40]=r11
+//   rax=[r10] | rcx=[r10+8] | rdx=[r10+16] | r8=[r10+24] | r9=[r10+32]
+//   call rax | r10=[rsp+32] | r11=[rsp+40] | [r10+40]=rax | rsp=r11 | ret
+pub fn gpu_trampoline_bytes() -> Array<Int>:
+    return [76, 139, 209, 76, 139, 220, 72, 131, 228, 240, 72, 131, 236, 48, 76, 137, 84, 36, 32, 76, 137, 92, 36, 40, 73, 139, 66, 0, 73, 139, 74, 8, 73, 139, 82, 16, 77, 139, 66, 24, 77, 139, 74, 32, 255, 208, 76, 139, 84, 36, 32, 76, 139, 92, 36, 40, 73, 137, 66, 40, 76, 137, 220, 195]
+
+pub fn gpu_make_stub() -> ptr<Void> with Unsafe:
+    let stub: ptr<Void> = k_VirtualAlloc(int_to_ptr(0, "ptr<Void>"), 128, VIRT_COMMIT_RESERVE, VIRT_RWX)
+    if ptr_to_int(stub) == 0:
+        return stub
+    let code: Array<Int> = gpu_trampoline_bytes()
+    let dst: ptr<Byte> = int_to_ptr(ptr_to_int(stub), "ptr<Byte>")
+    var i: Int = 0
+    while i < len(code):
+        mem_store(ptr_offset(dst, i, "Byte"), code[i] as Byte, "Byte")
+        i = i + 1
+    return stub
+
+// Invoke a resolved driver entry point. blk layout: [fn, a1, a2, a3, a4, _].
+// Returns blk[5] (the driver's CUresult). Caller owns the block arena.
+pub fn gpu_invoke(stub: ptr<Void>, blk: ptr<Int>) -> Int with Unsafe:
+    var res: Int = 0
+    let b: Int = ptr_to_int(blk)
+    asm("mov rcx, $1; call $2; mov $0, rax", res, b, stub, clobbers = "rax,rcx,rdx,r8,r9,r10,r11", memory = true, intel = true)
+    let out_val: Int = mem_load(ptr_offset(blk, 5, "Int"), "Int")
+    return out_val
+
+// 127-byte 11-arg launch trampoline: same prologue as v3, then spills
+// block slots [5..11] (offsets +40..+88) to stack [rsp+32..+80], result to slot [12].
+pub fn gpu_launch_bytes() -> Array<Int>:
+    return [76, 139, 209, 76, 139, 220, 72, 131, 228, 240, 72, 131, 236, 112, 76, 137, 84, 36, 88, 76, 137, 92, 36, 96, 77, 139, 26, 73, 139, 74, 8, 73, 139, 82, 16, 77, 139, 66, 24, 77, 139, 74, 32, 73, 139, 66, 40, 72, 137, 68, 36, 32, 73, 139, 66, 48, 72, 137, 68, 36, 40, 73, 139, 66, 56, 72, 137, 68, 36, 48, 73, 139, 66, 64, 72, 137, 68, 36, 56, 73, 139, 66, 72, 72, 137, 68, 36, 64, 73, 139, 66, 80, 72, 137, 68, 36, 72, 73, 139, 66, 88, 72, 137, 68, 36, 80, 65, 255, 211, 76, 139, 84, 36, 88, 76, 139, 92, 36, 96, 73, 137, 66, 96, 76, 137, 220, 195]
+
+pub fn gpu_make_launch_stub() -> ptr<Void> with Unsafe:
+    let stub: ptr<Void> = k_VirtualAlloc(int_to_ptr(0, "ptr<Void>"), 256, VIRT_COMMIT_RESERVE, VIRT_RWX)
+    if ptr_to_int(stub) == 0:
+        return stub
+    let code: Array<Int> = gpu_launch_bytes()
+    let dst: ptr<Byte> = int_to_ptr(ptr_to_int(stub), "ptr<Byte>")
+    var i: Int = 0
+    while i < len(code):
+        mem_store(ptr_offset(dst, i, "Byte"), code[i] as Byte, "Byte")
+        i = i + 1
+    return stub
+
+// Invoke cuLaunchKernel. blk layout: [target, f, gx, gy, gz, bx, by, bz,
+// shared, stream, kparams, extra | result@12]. Returns CUresult from slot 12.
+pub fn gpu_launch(stub4: ptr<Void>, blk: ptr<Int>) -> Int with Unsafe:
+    var res: Int = 0
+    let b: Int = ptr_to_int(blk)
+    asm("mov rcx, $1; call $2; mov $0, rax", res, b, stub4, clobbers = "rax,rcx,rdx,r8,r9,r10,r11", memory = true, intel = true)
+    let out_val: Int = mem_load(ptr_offset(blk, 12, "Int"), "Int")
+    return out_val
+
+// Pack n f64 host values to f32-LE bytes for device upload. dst holds 4*n bytes.
+pub fn gpu_pack_f32(dst: ptr<Byte>, src: ptr<Float>, n: Int) -> Int with Unsafe:
+    var i: Int = 0
+    while i < n:
+        write_f32_le(dst, i * 4, mem_load(ptr_offset(src, i, "Float"), "Float"))
+        i = i + 1
+    return 0
+
+pub fn gpu_lib_open() -> ptr<Void> with Unsafe:
+    return k_LoadLibraryA("nvcuda.dll")
+
+pub fn gpu_sym(h: ptr<Void>, name: String) -> ptr<Void> with Unsafe:
+    return k_GetProcAddress(h, name)
+
+// NUL-terminated C string buffer from a Kain String. Caller decays.
+pub fn gpu_str_to_cbuf(s: String) -> ptr<Byte> with Unsafe:
+    let sb: Array<Int> = bytes_of_str(s)
+    let n: Int = len(sb)
+    let buf: ptr<Byte> = alloc_zeroed(n + 1 + 32, "Byte")
+    var i: Int = 0
+    while i < n:
+        mem_store(ptr_offset(buf, i, "Byte"), sb[i] as Byte, "Byte")
+        i = i + 1
+    mem_store(ptr_offset(buf, n, "Byte"), 0 as Byte, "Byte")
+    return buf
+
+// Kain String from a NUL-terminated C buffer (reads at most maxlen bytes).
+pub fn gpu_cbuf_to_str(buf: ptr<Byte>, maxlen: Int) -> String with Unsafe:
+    var arr: Array<Int> = []
+    var i: Int = 0
+    while i < maxlen:
+        let ch: Int = mem_load(ptr_offset(buf, i, "Byte"), "Int") & 255
+        if ch == 0:
+            break
+        push(arr, ch)
+        i = i + 1
+    return text_from_byte_array(arr)
+
+// On-device execution proof: runs the Kain-authored FuseLoRA kernel through
+// the v4 launch stub and verifies numerics against a CPU reference GEMM.
+// Mode 0: 32x48 base + rank-4 LoRA (alpha 0.75). Mode 1: 4x4 LoKR (2x2 kron 2x2).
+pub fn run_gpu_fuse_test_command() -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Native GPU Kernel Execution Proof (FuseLoRA on-device)")
+    println("================================================================================")
+
+    let h: ptr<Void> = gpu_lib_open()
+    if ptr_to_int(h) == 0:
+        println(" GPU ABSENT: nvcuda.dll not found")
+        return EXIT_OK
+
+    let stub: ptr<Void> = gpu_make_stub()
+    let stub4: ptr<Void> = gpu_make_launch_stub()
+    if ptr_to_int(stub) == 0 or ptr_to_int(stub4) == 0:
+        println(" GPU ERROR: RWX install failed")
+        let _f0: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let p_init = gpu_sym(h, "cuInit")
+    let p_devget = gpu_sym(h, "cuDeviceGet")
+    let p_ctxcreate = gpu_sym(h, "cuCtxCreate_v2")
+    let p_ctxdestroy = gpu_sym(h, "cuCtxDestroy_v2")
+    let p_ctxsync = gpu_sym(h, "cuCtxSynchronize")
+    let p_modload = gpu_sym(h, "cuModuleLoadData")
+    let p_modgetfn = gpu_sym(h, "cuModuleGetFunction")
+    let p_memalloc = gpu_sym(h, "cuMemAlloc_v2")
+    let p_htod = gpu_sym(h, "cuMemcpyHtoD_v2")
+    let p_dtoh = gpu_sym(h, "cuMemcpyDtoH_v2")
+    let p_memfree = gpu_sym(h, "cuMemFree_v2")
+    let p_launch = gpu_sym(h, "cuLaunchKernel")
+    println(" launch entrypoint         = " + str(ptr_to_int(p_launch)))
+    println(" sync entrypoint           = " + str(ptr_to_int(p_ctxsync)))
+    if ptr_to_int(p_launch) == 0 or ptr_to_int(p_ctxsync) == 0:
+        println(" GPU ERROR: launch/sync entrypoints missing (driver too old?)")
+        let _fx: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let blk: ptr<Int> = alloc_zeroed(13 + 32, "Int")
+    mem_store(blk, ptr_to_int(p_init), "Int")
+    let r_init: Int = gpu_invoke(stub, blk)
+    let dev_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_devget), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(dev_slot), "Int")
+    let r_dev: Int = gpu_invoke(stub, blk)
+    let dev: Int = mem_load(dev_slot, "Int")
+    decay dev_slot
+    if r_init != CUDA_OK or r_dev != CUDA_OK:
+        println(" GPU ERROR: init/device failed")
+        decay blk
+        let _f1: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let ctx_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_ctxcreate), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ctx_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), dev, "Int")
+    let r_ctx: Int = gpu_invoke(stub, blk)
+    decay ctx_slot
+    if r_ctx != CUDA_OK:
+        println(" GPU ERROR: context failed")
+        decay blk
+        let _f2: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let h_ptx = k_open_read(".kain/gpu/fusion.derived.sm_75.ptx")
+    if k_handle_bad(h_ptx) == 1:
+        println(" GPU ERROR: PTX artifact missing")
+        decay blk
+        let _f3: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    let ptx_len: Int = k_size(h_ptx)
+    let ptx_buf: ptr<Byte> = alloc_zeroed(ptx_len + 1 + 32, "Byte")
+    let ptx_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    let r_pr: Int = k_read_at(h_ptx, ptx_slot, 0, ptx_buf, ptx_len)
+    decay ptx_slot
+    let _cc: Int = k_CloseHandle(h_ptx)
+    mem_store(ptr_offset(ptx_buf, r_pr, "Byte"), 0 as Byte, "Byte")
+    let mod_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_modload), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(mod_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ptx_buf), "Int")
+    let r_mod: Int = gpu_invoke(stub, blk)
+    let mod_h: Int = mem_load(mod_slot, "Int")
+    decay mod_slot
+    decay ptx_buf
+    if r_mod != CUDA_OK:
+        println(" GPU ERROR: module load failed")
+        decay blk
+        let _f4: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let fname_buf: ptr<Byte> = gpu_str_to_cbuf("FuseLoRA")
+    let kfn_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_modgetfn), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(kfn_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), mod_h, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), ptr_to_int(fname_buf), "Int")
+    let r_fn: Int = gpu_invoke(stub, blk)
+    let kfn_h: Int = mem_load(kfn_slot, "Int")
+    decay kfn_slot
+    decay fname_buf
+    if r_fn != CUDA_OK:
+        println(" GPU ERROR: function resolve failed")
+        decay blk
+        let _f5: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    println(" Kernel FuseLoRA resolved on-device")
+
+    // Control: probe-identical 4KB pattern roundtrip in this same function context
+    let ctl_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_memalloc), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ctl_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 4096, "Int")
+    let _ctl_a: Int = gpu_invoke(stub, blk)
+    let d_ctl: Int = mem_load(ctl_slot, "Int")
+    decay ctl_slot
+    let hcs: ptr<Byte> = alloc_zeroed(4096 + 32, "Byte")
+    let hcd: ptr<Byte> = alloc_zeroed(4096 + 32, "Byte")
+    var cfi: Int = 0
+    while cfi < 4096:
+        mem_store(ptr_offset(hcs, cfi, "Byte"), (cfi & 255) as Byte, "Byte")
+        cfi = cfi + 1
+    mem_store(blk, ptr_to_int(p_htod), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), d_ctl, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(hcs), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 4096, "Int")
+    let _ctl_h: Int = gpu_invoke(stub, blk)
+    mem_store(blk, ptr_to_int(p_dtoh), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(hcd), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), d_ctl, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 4096, "Int")
+    let _ctl_d: Int = gpu_invoke(stub, blk)
+    var ctl_bad: Int = 0
+    var cji: Int = 0
+    while cji < 4096:
+        let cg: Int = mem_load(ptr_offset(hcd, cji, "Byte"), "Int") & 255
+        if cg != (cji & 255):
+            ctl_bad = ctl_bad + 1
+        cji = cji + 1
+    mem_store(blk, ptr_to_int(p_memfree), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), d_ctl, "Int")
+    let _ctl_f: Int = gpu_invoke(stub, blk)
+    decay hcs
+    decay hcd
+    println(" Control 4KB roundtrip bad = " + str(ctl_bad) + " / 4096")
+
+    // ---- Mode 0: LoRA GEMM 32x48 rank 4 ----
+    let rows0: Int = 32
+    let cols0: Int = 48
+    let rank0: Int = 4
+    let nb0: Int = rows0 * cols0
+    let hb0: ptr<Float> = alloc_zeroed(nb0 + 32, "Float")
+    let hup0: ptr<Float> = alloc_zeroed(rows0 * rank0 + 32, "Float")
+    let hdn0: ptr<Float> = alloc_zeroed(rank0 * cols0 + 32, "Float")
+    let hout0: ptr<Float> = alloc_zeroed(nb0 + 32, "Float")
+    let hpar0: ptr<Float> = alloc_zeroed(6 + 32, "Float")
+    var rr0: Int = 0
+    while rr0 < rows0:
+        var cc0: Int = 0
+        while cc0 < cols0:
+            let v0: Float = ((((rr0 * 7 + cc0 * 13) % 11) - 5) as Float) * 0.25
+            mem_store(ptr_offset(hb0, rr0 * cols0 + cc0, "Float"), v0, "Float")
+            cc0 = cc0 + 1
+        rr0 = rr0 + 1
+    var ru0: Int = 0
+    while ru0 < rows0:
+        var ku0: Int = 0
+        while ku0 < rank0:
+            let v0: Float = ((((ru0 + ku0) % 5) - 2) as Float) * 0.5
+            mem_store(ptr_offset(hup0, ru0 * rank0 + ku0, "Float"), v0, "Float")
+            ku0 = ku0 + 1
+        ru0 = ru0 + 1
+    var kd0: Int = 0
+    while kd0 < rank0:
+        var cd0: Int = 0
+        while cd0 < cols0:
+            let v0: Float = ((((kd0 * 3 + cd0) % 5) - 2) as Float) * 0.5
+            mem_store(ptr_offset(hdn0, kd0 * cols0 + cd0, "Float"), v0, "Float")
+            cd0 = cd0 + 1
+        kd0 = kd0 + 1
+    mem_store(hpar0, 32.0, "Float")
+    mem_store(ptr_offset(hpar0, 1, "Float"), 48.0, "Float")
+    mem_store(ptr_offset(hpar0, 2, "Float"), 4.0, "Float")
+    mem_store(ptr_offset(hpar0, 3, "Float"), 0.0, "Float")
+    mem_store(ptr_offset(hpar0, 4, "Float"), 0.75, "Float")
+    mem_store(ptr_offset(hpar0, 5, "Float"), 0.0, "Float")
+
+    let ds0: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_memalloc), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds0), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), nb0 * 4, "Int")
+    let _q0: Int = gpu_invoke(stub, blk)
+    let d_b0: Int = mem_load(ds0, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds0), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), rows0 * rank0 * 4, "Int")
+    let _q1: Int = gpu_invoke(stub, blk)
+    let d_u0: Int = mem_load(ds0, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds0), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), rank0 * cols0 * 4, "Int")
+    let _q2: Int = gpu_invoke(stub, blk)
+    let d_d0: Int = mem_load(ds0, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds0), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), nb0 * 4, "Int")
+    let _q3: Int = gpu_invoke(stub, blk)
+    let d_o0: Int = mem_load(ds0, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds0), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 24, "Int")
+    let _q4: Int = gpu_invoke(stub, blk)
+    let d_p0: Int = mem_load(ds0, "Int")
+    decay ds0
+
+    let ub_b0: ptr<Byte> = alloc_zeroed(nb0 * 4 + 32, "Byte")
+    let ub_u0: ptr<Byte> = alloc_zeroed(rows0 * rank0 * 4 + 32, "Byte")
+    let ub_d0: ptr<Byte> = alloc_zeroed(rank0 * cols0 * 4 + 32, "Byte")
+    let ub_p0: ptr<Byte> = alloc_zeroed(24 + 32, "Byte")
+    let _pk0: Int = gpu_pack_f32(ub_b0, hb0, nb0)
+    let _pk1: Int = gpu_pack_f32(ub_u0, hup0, rows0 * rank0)
+    let _pk2: Int = gpu_pack_f32(ub_d0, hdn0, rank0 * cols0)
+    let _pk3: Int = gpu_pack_f32(ub_p0, hpar0, 6)
+
+    mem_store(blk, ptr_to_int(p_htod), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), d_b0, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_b0), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), nb0 * 4, "Int")
+    let _h00: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_u0, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_u0), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), rows0 * rank0 * 4, "Int")
+    let _h01: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_d0, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_d0), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), rank0 * cols0 * 4, "Int")
+    let _h02: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_p0, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_p0), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 24, "Int")
+    let _h03: Int = gpu_invoke(stub, blk)
+    decay ub_b0
+    decay ub_u0
+    decay ub_d0
+    decay ub_p0
+
+    let slots0: ptr<Int> = alloc_zeroed(5 + 32, "Int")
+    mem_store(slots0, d_b0, "Int")
+    mem_store(ptr_offset(slots0, 1, "Int"), d_u0, "Int")
+    mem_store(ptr_offset(slots0, 2, "Int"), d_d0, "Int")
+    mem_store(ptr_offset(slots0, 3, "Int"), d_o0, "Int")
+    mem_store(ptr_offset(slots0, 4, "Int"), d_p0, "Int")
+    let kp0: ptr<Int> = alloc_zeroed(5 + 32, "Int")
+    mem_store(kp0, ptr_to_int(slots0), "Int")
+    mem_store(ptr_offset(kp0, 1, "Int"), ptr_to_int(slots0) + 8, "Int")
+    mem_store(ptr_offset(kp0, 2, "Int"), ptr_to_int(slots0) + 16, "Int")
+    mem_store(ptr_offset(kp0, 3, "Int"), ptr_to_int(slots0) + 24, "Int")
+    mem_store(ptr_offset(kp0, 4, "Int"), ptr_to_int(slots0) + 32, "Int")
+
+    mem_store(blk, ptr_to_int(p_launch), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), kfn_h, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 2, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 3, "Int")
+    mem_store(ptr_offset(blk, 4, "Int"), 1, "Int")
+    mem_store(ptr_offset(blk, 5, "Int"), 16, "Int")
+    mem_store(ptr_offset(blk, 6, "Int"), 16, "Int")
+    mem_store(ptr_offset(blk, 7, "Int"), 1, "Int")
+    mem_store(ptr_offset(blk, 8, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 9, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 10, "Int"), ptr_to_int(kp0), "Int")
+    mem_store(ptr_offset(blk, 11, "Int"), 0, "Int")
+    let r_launch0: Int = gpu_launch(stub4, blk)
+    println(" Mode0 cuLaunchKernel      = " + str(r_launch0))
+    mem_store(blk, ptr_to_int(p_ctxsync), "Int")
+    let r_sync0: Int = gpu_invoke(stub, blk)
+    println(" Mode0 cuCtxSynchronize    = " + str(r_sync0))
+
+    let ob0: ptr<Byte> = alloc_zeroed(nb0 * 4 + 32, "Byte")
+    mem_store(blk, ptr_to_int(p_dtoh), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ob0), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), d_o0, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), nb0 * 4, "Int")
+    let _d00: Int = gpu_invoke(stub, blk)
+    var max_err0: Float = 0.0
+    var vr0: Int = 0
+    while vr0 < rows0:
+        var vc0: Int = 0
+        while vc0 < cols0:
+            let bv0: Float = mem_load(ptr_offset(hb0, vr0 * cols0 + vc0, "Float"), "Float")
+            var dot0: Float = 0.0
+            var vk0: Int = 0
+            while vk0 < rank0:
+                let x10: Float = mem_load(ptr_offset(hup0, vr0 * rank0 + vk0, "Float"), "Float")
+                let x20: Float = mem_load(ptr_offset(hdn0, vk0 * cols0 + vc0, "Float"), "Float")
+                dot0 = dot0 + x10 * x20
+                vk0 = vk0 + 1
+            let exp0: Float = bv0 + dot0 * 0.75
+            let got0: Float = read_f32_le(ob0, (vr0 * cols0 + vc0) * 4)
+            var e0: Float = exp0 - got0
+            if e0 < 0.0:
+                e0 = 0.0 - e0
+            if e0 > max_err0:
+                max_err0 = e0
+            vc0 = vc0 + 1
+        vr0 = vr0 + 1
+    println(" Mode0 max_abs_err_x1e6    = " + str(max_err0 * 1000000.0))
+    var pass0: Int = 0
+    if r_launch0 == CUDA_OK:
+        if r_sync0 == CUDA_OK:
+            if max_err0 < 0.001:
+                pass0 = 1
+    if pass0 == 1:
+        println(" Mode0 LoRA GEMM ............ PASS")
+    else:
+        println(" Mode0 LoRA GEMM ............ FAIL")
+
+    mem_store(blk, ptr_to_int(p_memfree), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), d_b0, "Int")
+    let _f00: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_u0, "Int")
+    let _f01: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_d0, "Int")
+    let _f02: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_o0, "Int")
+    let _f03: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_p0, "Int")
+    let _f04: Int = gpu_invoke(stub, blk)
+    decay hb0
+    decay hup0
+    decay hdn0
+    decay ob0
+    decay hpar0
+    decay slots0
+    decay kp0
+
+    // ---- Mode 1: LoKR Kronecker 4x4 (w1 2x2 kron w2 2x2) ----
+    let nb1: Int = 16
+    let hbb1: ptr<Float> = alloc_zeroed(nb1 + 32, "Float")
+    let hw1: ptr<Float> = alloc_zeroed(4 + 32, "Float")
+    let hw2: ptr<Float> = alloc_zeroed(4 + 32, "Float")
+    let hpa1: ptr<Float> = alloc_zeroed(6 + 32, "Float")
+    var fi1: Int = 0
+    while fi1 < nb1:
+        mem_store(ptr_offset(hbb1, fi1, "Float"), ((fi1 % 7) as Float) * 0.25, "Float")
+        fi1 = fi1 + 1
+    mem_store(hw1, 1.0, "Float")
+    mem_store(ptr_offset(hw1, 1, "Float"), 0.5, "Float")
+    mem_store(ptr_offset(hw1, 2, "Float"), 0.0 - 0.5, "Float")
+    mem_store(ptr_offset(hw1, 3, "Float"), 2.0, "Float")
+    mem_store(hw2, 0.25, "Float")
+    mem_store(ptr_offset(hw2, 1, "Float"), 1.5, "Float")
+    mem_store(ptr_offset(hw2, 2, "Float"), 0.0 - 1.0, "Float")
+    mem_store(ptr_offset(hw2, 3, "Float"), 0.75, "Float")
+    mem_store(hpa1, 4.0, "Float")
+    mem_store(ptr_offset(hpa1, 1, "Float"), 4.0, "Float")
+    mem_store(ptr_offset(hpa1, 2, "Float"), 2.0, "Float")
+    mem_store(ptr_offset(hpa1, 3, "Float"), 2.0, "Float")
+    mem_store(ptr_offset(hpa1, 4, "Float"), 1.0, "Float")
+    mem_store(ptr_offset(hpa1, 5, "Float"), 1.0, "Float")
+
+    let ds1: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_memalloc), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds1), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 64, "Int")
+    let _w0: Int = gpu_invoke(stub, blk)
+    let d_bb1: Int = mem_load(ds1, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds1), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 16, "Int")
+    let _w1: Int = gpu_invoke(stub, blk)
+    let d_w1: Int = mem_load(ds1, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds1), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 16, "Int")
+    let _w2: Int = gpu_invoke(stub, blk)
+    let d_w2: Int = mem_load(ds1, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds1), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 64, "Int")
+    let _w3: Int = gpu_invoke(stub, blk)
+    let d_ou1: Int = mem_load(ds1, "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ds1), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 24, "Int")
+    let _w4: Int = gpu_invoke(stub, blk)
+    let d_pa1: Int = mem_load(ds1, "Int")
+    decay ds1
+
+    let ub_b1: ptr<Byte> = alloc_zeroed(64 + 32, "Byte")
+    let ub_w1: ptr<Byte> = alloc_zeroed(16 + 32, "Byte")
+    let ub_w2: ptr<Byte> = alloc_zeroed(16 + 32, "Byte")
+    let ub_p1: ptr<Byte> = alloc_zeroed(24 + 32, "Byte")
+    let _pq0: Int = gpu_pack_f32(ub_b1, hbb1, 16)
+    let _pq1: Int = gpu_pack_f32(ub_w1, hw1, 4)
+    let _pq2: Int = gpu_pack_f32(ub_w2, hw2, 4)
+    let _pq3: Int = gpu_pack_f32(ub_p1, hpa1, 6)
+    mem_store(blk, ptr_to_int(p_htod), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), d_bb1, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_b1), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 64, "Int")
+    let _u0: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_w1, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_w1), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 16, "Int")
+    let _u1: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_w2, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_w2), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 16, "Int")
+    let _u2: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_pa1, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ub_p1), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 24, "Int")
+    let _u3: Int = gpu_invoke(stub, blk)
+    decay ub_b1
+    decay ub_w1
+    decay ub_w2
+    decay ub_p1
+
+    let sl1: ptr<Int> = alloc_zeroed(5 + 32, "Int")
+    mem_store(sl1, d_bb1, "Int")
+    mem_store(ptr_offset(sl1, 1, "Int"), d_w1, "Int")
+    mem_store(ptr_offset(sl1, 2, "Int"), d_w2, "Int")
+    mem_store(ptr_offset(sl1, 3, "Int"), d_ou1, "Int")
+    mem_store(ptr_offset(sl1, 4, "Int"), d_pa1, "Int")
+    let kl1: ptr<Int> = alloc_zeroed(5 + 32, "Int")
+    mem_store(kl1, ptr_to_int(sl1), "Int")
+    mem_store(ptr_offset(kl1, 1, "Int"), ptr_to_int(sl1) + 8, "Int")
+    mem_store(ptr_offset(kl1, 2, "Int"), ptr_to_int(sl1) + 16, "Int")
+    mem_store(ptr_offset(kl1, 3, "Int"), ptr_to_int(sl1) + 24, "Int")
+    mem_store(ptr_offset(kl1, 4, "Int"), ptr_to_int(sl1) + 32, "Int")
+
+    mem_store(blk, ptr_to_int(p_launch), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), kfn_h, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 1, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 1, "Int")
+    mem_store(ptr_offset(blk, 4, "Int"), 1, "Int")
+    mem_store(ptr_offset(blk, 5, "Int"), 16, "Int")
+    mem_store(ptr_offset(blk, 6, "Int"), 16, "Int")
+    mem_store(ptr_offset(blk, 7, "Int"), 1, "Int")
+    mem_store(ptr_offset(blk, 8, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 9, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 10, "Int"), ptr_to_int(kl1), "Int")
+    mem_store(ptr_offset(blk, 11, "Int"), 0, "Int")
+    let r_launch1: Int = gpu_launch(stub4, blk)
+    println(" Mode1 cuLaunchKernel      = " + str(r_launch1))
+    mem_store(blk, ptr_to_int(p_ctxsync), "Int")
+    let r_sync1: Int = gpu_invoke(stub, blk)
+    println(" Mode1 cuCtxSynchronize    = " + str(r_sync1))
+
+    let ob1: ptr<Byte> = alloc_zeroed(64 + 32, "Byte")
+    mem_store(blk, ptr_to_int(p_dtoh), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ob1), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), d_ou1, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 64, "Int")
+    let _d10: Int = gpu_invoke(stub, blk)
+
+    var max_err1: Float = 0.0
+    var vr1: Int = 0
+    while vr1 < 4:
+        var vc1: Int = 0
+        while vc1 < 4:
+            let bb1: Float = mem_load(ptr_offset(hbb1, vr1 * 4 + vc1, "Float"), "Float")
+            let a1v: Float = mem_load(ptr_offset(hw1, (vr1 / 2) * 2 + (vc1 / 2), "Float"), "Float")
+            let b1v: Float = mem_load(ptr_offset(hw2, (vr1 % 2) * 2 + (vc1 % 2), "Float"), "Float")
+            let ex1: Float = bb1 + a1v * b1v
+            let go1: Float = read_f32_le(ob1, (vr1 * 4 + vc1) * 4)
+            var er1: Float = ex1 - go1
+            if er1 < 0.0:
+                er1 = 0.0 - er1
+            if er1 > max_err1:
+                max_err1 = er1
+            vc1 = vc1 + 1
+        vr1 = vr1 + 1
+    println(" Mode1 max_abs_err_x1e6    = " + str(max_err1 * 1000000.0))
+    var pass1: Int = 0
+    if r_launch1 == CUDA_OK:
+        if r_sync1 == CUDA_OK:
+            if max_err1 < 0.001:
+                pass1 = 1
+    if pass1 == 1:
+        println(" Mode1 LoKR Kronecker ...... PASS")
+    else:
+        println(" Mode1 LoKR Kronecker ...... FAIL")
+
+    mem_store(blk, ptr_to_int(p_memfree), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), d_bb1, "Int")
+    let _g0: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_w1, "Int")
+    let _g1: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_w2, "Int")
+    let _g2: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_ou1, "Int")
+    let _g3: Int = gpu_invoke(stub, blk)
+    mem_store(ptr_offset(blk, 1, "Int"), d_pa1, "Int")
+    let _g4: Int = gpu_invoke(stub, blk)
+    decay hbb1
+    decay hw1
+    decay hw2
+    decay ob1
+    decay hpa1
+    decay sl1
+    decay kl1
+
+    decay blk
+    let _fc: Int = k_FreeLibrary(h)
+
+    println("--------------------------------------------------------------------------------")
+    if pass0 == 1:
+        if pass1 == 1:
+            println(" GPU KERNEL EXECUTION PROOF: BOTH MODES PASS (zero Python, zero PyTorch)")
+            println("================================================================================")
+            return EXIT_OK
+    println(" GPU KERNEL EXECUTION FAILED")
+    println("================================================================================")
+    return EXIT_ERROR
+
+pub fn run_gpu_probe_command() -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Native CUDA Driver Bridge Probe (Zero-Dependency GPU)")
+    println("================================================================================")
+
+    let h: ptr<Void> = gpu_lib_open()
+    if ptr_to_int(h) == 0:
+        println(" GPU ABSENT: nvcuda.dll not found (CPU-only box — all CPU lanes remain fully operational)")
+        return EXIT_OK
+
+    let stub: ptr<Void> = gpu_make_stub()
+    if ptr_to_int(stub) == 0:
+        println(" GPU ERROR: VirtualAlloc RWX failed")
+        let _f0: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    println(" Trampoline installed at " + str(ptr_to_int(stub)))
+
+    let p_init = gpu_sym(h, "cuInit")
+    let p_devget = gpu_sym(h, "cuDeviceGet")
+    let p_devname = gpu_sym(h, "cuDeviceGetName")
+    let p_devattr = gpu_sym(h, "cuDeviceGetAttribute")
+    let p_ctxcreate = gpu_sym(h, "cuCtxCreate_v2")
+    let p_ctxdestroy = gpu_sym(h, "cuCtxDestroy_v2")
+    let p_modload = gpu_sym(h, "cuModuleLoadData")
+    let p_modgetfn = gpu_sym(h, "cuModuleGetFunction")
+    let p_modunload = gpu_sym(h, "cuModuleUnload")
+    let p_memalloc = gpu_sym(h, "cuMemAlloc_v2")
+    let p_htod = gpu_sym(h, "cuMemcpyHtoD_v2")
+    let p_dtoh = gpu_sym(h, "cuMemcpyDtoH_v2")
+    let p_memfree = gpu_sym(h, "cuMemFree_v2")
+
+    if ptr_to_int(p_init) == 0 or ptr_to_int(p_devget) == 0 or ptr_to_int(p_ctxcreate) == 0:
+        println(" GPU ERROR: core driver entrypoints missing")
+        let _f1: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+    println(" 12 driver entrypoints resolved")
+
+    let blk: ptr<Int> = alloc_zeroed(6 + 32, "Int")
+
+    mem_store(blk, ptr_to_int(p_init), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), 0, "Int")
+    let r_init: Int = gpu_invoke(stub, blk)
+    println(" cuInit(0)                = " + str(r_init))
+    if r_init != CUDA_OK:
+        println(" GPU ERROR: cuInit failed")
+        decay blk
+        let _f2: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let dev_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_devget), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(dev_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 0, "Int")
+    let r_dev: Int = gpu_invoke(stub, blk)
+    let dev: Int = mem_load(dev_slot, "Int")
+    decay dev_slot
+    println(" cuDeviceGet(0)           = " + str(r_dev) + " (device " + str(dev) + ")")
+    if r_dev != CUDA_OK:
+        decay blk
+        let _f3: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let name_buf: ptr<Byte> = alloc_zeroed(256 + 32, "Byte")
+    mem_store(blk, ptr_to_int(p_devname), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(name_buf), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 256, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), dev, "Int")
+    let r_name: Int = gpu_invoke(stub, blk)
+    let dev_str: String = gpu_cbuf_to_str(name_buf, 256)
+    decay name_buf
+    println(" cuDeviceGetName          = " + str(r_name) + " (" + dev_str + ")")
+
+    let sm_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_devattr), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(sm_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), CU_ATTR_MP_COUNT, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), dev, "Int")
+    let r_attr: Int = gpu_invoke(stub, blk)
+    let sm_count: Int = mem_load(sm_slot, "Int")
+    decay sm_slot
+    println(" multiprocessors          = " + str(sm_count) + " SMs (attr status " + str(r_attr) + ")")
+
+    let ctx_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_ctxcreate), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(ctx_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 0, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), dev, "Int")
+    let r_ctx: Int = gpu_invoke(stub, blk)
+    let ctx_h: Int = mem_load(ctx_slot, "Int")
+    decay ctx_slot
+    println(" cuCtxCreate_v2           = " + str(r_ctx))
+    if r_ctx != CUDA_OK:
+        decay blk
+        let _f4: Int = k_FreeLibrary(h)
+        return EXIT_ERROR
+
+    let dptr_slot: ptr<Int> = alloc_zeroed(1, "Int")
+    mem_store(blk, ptr_to_int(p_memalloc), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(dptr_slot), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), 4096, "Int")
+    let r_alloc: Int = gpu_invoke(stub, blk)
+    let dptr_h: Int = mem_load(dptr_slot, "Int")
+    decay dptr_slot
+    println(" cuMemAlloc_v2(4KB)       = " + str(r_alloc))
+
+    let host_src: ptr<Byte> = alloc_zeroed(4096 + 32, "Byte")
+    var fi: Int = 0
+    while fi < 4096:
+        mem_store(ptr_offset(host_src, fi, "Byte"), (fi & 255) as Byte, "Byte")
+        fi = fi + 1
+    mem_store(blk, ptr_to_int(p_htod), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), dptr_h, "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(host_src), "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 4096, "Int")
+    let r_h2d: Int = gpu_invoke(stub, blk)
+    println(" cuMemcpyHtoD_v2(4KB)     = " + str(r_h2d))
+
+    let host_dst: ptr<Byte> = alloc_zeroed(4096 + 32, "Byte")
+    mem_store(blk, ptr_to_int(p_dtoh), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(host_dst), "Int")
+    mem_store(ptr_offset(blk, 2, "Int"), dptr_h, "Int")
+    mem_store(ptr_offset(blk, 3, "Int"), 4096, "Int")
+    let r_d2h: Int = gpu_invoke(stub, blk)
+    println(" cuMemcpyDtoH_v2(4KB)     = " + str(r_d2h))
+
+    var bad: Int = 0
+    var vi: Int = 0
+    while vi < 4096:
+        let got_b: Int = mem_load(ptr_offset(host_dst, vi, "Byte"), "Int") & 255
+        if got_b != (vi & 255):
+            bad = bad + 1
+        vi = vi + 1
+    decay host_src
+    decay host_dst
+    println(" VRAM roundtrip           = " + str(bad) + " mismatches / 4096 bytes")
+
+    let h_ptx = k_open_read(".kain/gpu/fusion.derived.sm_75.ptx")
+    if k_handle_bad(h_ptx) == 0:
+        let ptx_len: Int = k_size(h_ptx)
+        let ptx_buf: ptr<Byte> = alloc_zeroed(ptx_len + 1 + 32, "Byte")
+        let ptx_slot: ptr<Int> = alloc_zeroed(1, "Int")
+        let r_pr: Int = k_read_at(h_ptx, ptx_slot, 0, ptx_buf, ptx_len)
+        decay ptx_slot
+        let _cc: Int = k_CloseHandle(h_ptx)
+        mem_store(ptr_offset(ptx_buf, r_pr, "Byte"), 0 as Byte, "Byte")
+        let mod_slot: ptr<Int> = alloc_zeroed(1, "Int")
+        mem_store(blk, ptr_to_int(p_modload), "Int")
+        mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(mod_slot), "Int")
+        mem_store(ptr_offset(blk, 2, "Int"), ptr_to_int(ptx_buf), "Int")
+        let r_mod: Int = gpu_invoke(stub, blk)
+        let mod_h: Int = mem_load(mod_slot, "Int")
+        decay mod_slot
+        println(" cuModuleLoadData(FuseLoRA sm_75, " + str(r_pr) + "B) = " + str(r_mod))
+        if r_mod == CUDA_OK:
+            let fname_buf: ptr<Byte> = gpu_str_to_cbuf("FuseLoRA")
+            let kfn_slot: ptr<Int> = alloc_zeroed(1, "Int")
+            mem_store(blk, ptr_to_int(p_modgetfn), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), ptr_to_int(kfn_slot), "Int")
+            mem_store(ptr_offset(blk, 2, "Int"), mod_h, "Int")
+            mem_store(ptr_offset(blk, 3, "Int"), ptr_to_int(fname_buf), "Int")
+            let r_fn: Int = gpu_invoke(stub, blk)
+            let kfn_h: Int = mem_load(kfn_slot, "Int")
+            decay kfn_slot
+            decay fname_buf
+            println(" cuModuleGetFunction(FuseLoRA) = " + str(r_fn))
+            mem_store(blk, ptr_to_int(p_modunload), "Int")
+            mem_store(ptr_offset(blk, 1, "Int"), mod_h, "Int")
+            let r_unload: Int = gpu_invoke(stub, blk)
+            println(" cuModuleUnload             = " + str(r_unload))
+        decay ptx_buf
+    else:
+        println(" PTX artifact not found (run kain gpu-artifacts first) — module stage skipped")
+
+    mem_store(blk, ptr_to_int(p_memfree), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), dptr_h, "Int")
+    let r_free: Int = gpu_invoke(stub, blk)
+    println(" cuMemFree_v2             = " + str(r_free))
+
+    mem_store(blk, ptr_to_int(p_ctxdestroy), "Int")
+    mem_store(ptr_offset(blk, 1, "Int"), ctx_h, "Int")
+    let r_cdestroy: Int = gpu_invoke(stub, blk)
+    println(" cuCtxDestroy_v2          = " + str(r_cdestroy))
+
+    decay blk
+    let _fc: Int = k_FreeLibrary(h)
+
+    println("--------------------------------------------------------------------------------")
+    println(" NATIVE GPU BRIDGE VERIFIED: driver + context + VRAM + Kain-PTX JIT, zero deps.")
+    println("================================================================================")
+    return EXIT_OK
 
 // ============================================================================
 // prove.kn

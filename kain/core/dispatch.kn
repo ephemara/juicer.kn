@@ -33,6 +33,7 @@ fn print_usage():
     println("  fuse <model.gguf> <lora.safetensors> [--strength 1.0] [--drop <list>] --out <fused.gguf>")
     println("                                         Bake LoRA directly into GGUF weights via CUDA")
     println("                                         (Optionally slice/drop blocks in the same pass)")
+    println("                                         [--native fuses 100% in-Kain: exact bases, Q8_0 out]")
     println("  slice <model.gguf> --drop <list> --out <out.gguf>")
     println("                                         Physically excise dead layers & rewrite GGUF")
     println("                                         (e.g. --drop 18,19,23,24 --out wan2.1-11b.gguf)")
@@ -41,6 +42,8 @@ fn print_usage():
     println("  schedule <model.gguf|.safetensors> --steps 4 --out <recipe.json>")
     println("                                         Emit dynamic step-skipping recipe for ComfyUI")
     println("  prove                                  Run 11-point in-memory formal verification battery")
+    println("  gpu-probe                              Verify native CUDA driver bridge (context/VRAM/Kain-PTX JIT)")
+    println("  gpu-fuse-test                          Prove on-device FuseLoRA numerics vs CPU reference GEMM")
     println("  help                                   Show this handbook\n")
     println("EXAMPLES:")
     println("  juicer profile models/diffusion_models/wan2.1-i2v-14b-480p-Q4_K_M.gguf")
@@ -394,6 +397,12 @@ fn main() -> Int with Unsafe:
     if cmd == "prove":
         return run_prove_battery()
 
+    if cmd == "gpu-probe":
+        return run_gpu_probe_command()
+
+    if cmd == "gpu-fuse-test":
+        return run_gpu_fuse_test_command()
+
     if cmd == "profile":
         if len(args) < 2:
             println("error: profile requires a model path. usage: juicer profile <model.gguf>")
@@ -410,6 +419,7 @@ fn main() -> Int with Unsafe:
         var strength: Float = 1.0
         var drop_list: Array<Int> = []
         var out_path: String = "fused_model.gguf"
+        var use_native: Int = 0
 
         var i: Int = 3
         while i < len(args):
@@ -422,8 +432,15 @@ fn main() -> Int with Unsafe:
             elif args[i] == "--out" and i + 1 < len(args):
                 out_path = args[i + 1]
                 i = i + 1
+            elif args[i] == "--native":
+                use_native = 1
             i = i + 1
 
+        if use_native == 1:
+            if len(drop_list) > 0:
+                println("fuse --native does not take --drop (slice separately with jc slice)")
+                return EXIT_ERROR
+            return execute_native_gpu_fuse(base_path, lora_path, strength, out_path)
         return execute_lora_fuse(base_path, lora_path, strength, drop_list, out_path)
 
     if cmd == "slice":

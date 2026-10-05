@@ -64,7 +64,7 @@ thresholds are still unvalidated hunches — lenses nominate, rendering decides.
 | **GGUF v2/v3 DMA parser** — header, KV scan, tensor descriptors (name/dims/type/offset), per-block byte+tensor census across `blocks.<i>`, `double_blocks.<i>`, `single_blocks.<i>`, plus per-block DMA weight sampling (F32/F16/BF16/Q8_0/Q4_0/Q4_K) | `gguf_parser.kn` | ✅ **REAL.** Reads the actual file over `kernel32`. 10.56 GB Wan 2.1 = 1,303 tensors / 40 blocks in ~40 ms |
 | **SafeTensors DMA parser** — zero-copy JSON header scan (dtype/shape/data_offsets) + raw-float streaming for BF16/F16/F32 masters | `safetensors_parser.kn` | ✅ **REAL.** `jc profile`/`schedule` auto-route `.safetensors` inputs |
 | **Physical slicer** — filter tensors, re-index `blocks.<i>` contiguously, recompute aligned offsets, patch tensor count **and** `*.block_count` KVs in-place, DMA-stream payloads | `slicer.kn` | ✅ **REAL.** Produced playable 16/20/24-block Wan GGUFs in ComfyUI; KV patch keeps llama.cpp/Ollama/LM Studio layer counts correct |
-| **LoRA fuse engine** — FP32/FP16 exact add for 1D, CUDA dequant → Tensor-Core GEMM → Q4_K requant for 2D (GGUF base only) | `fuse.kn` + `scripts/fuse_engine.py` | ✅ **REAL.** Numerically verified (<1e-4 err vs exact); ~0.9 s/block on a Quadro RTX 3000 |
+| **LoRA fuse engine** — FP32/FP16 exact add for 1D, CUDA dequant → Tensor-Core GEMM → Q4_K requant for 2D (GGUF base only) | `fuse.kn` (+ `scripts/fuse_engine.py`) | ✅ **REAL.** Numerically verified (<1e-4 err vs exact); ~0.9 s/block on a Quadro RTX 3000. **Native path**: `jc fuse --native` runs 100% in-Kain (exact-decodable GGUF + safetensors LoRA, on-device GEMM, Q8_0 out; E2E max err 0.0038) |
 | **Native quantizer** — Q8_0 (34 B) / Q4_0 (18 B) block quantize + dequantize + container re-write; float sources only, quantized/1D/odd-shape tensors pass through | `quantize.kn` | ✅ **REAL.** Prove SNR 49.5 dB (Q8_0), 25.0 dB (Q4_0) on sine fixtures |
 | **Prove battery** — LE decoders, IEEE-754 + FP16 roundtrip, power iteration, 5D Lehmer entropy, IRPD bicoherence, FrFT schedule, re-index + KV-patch invariant, LoRA keys, Q8_0/Q4_0 SNR, SafeTensors roundtrip | `prove.kn` | ✅ **REAL**, 11/11 — primitives **and** lens/quantizer math invariants |
 | **CLI / dispatch / scheduler JSON emit** | `dispatch.kn`, `scheduler.kn` | ✅ REAL plumbing for both `.gguf` and `.safetensors` |
@@ -436,8 +436,10 @@ CUDA-enabled Python with `torch` + `gguf` (the ComfyUI embedded interpreter). So
 6. **Exactly one `decay` per arena per function** on the success path.
    Error paths leak; the OS reclaims on exit.
 7. **Zero framework tax in the execution path.**
-   No Python / PyTorch / CUDA DLL dependency in `juicer.exe`. It is a standalone native
-   binary under 1.5 MB with `kernel32` as its only import family.
+   No Python / PyTorch / CUDA Toolkit dependency in `juicer.exe`. It is a standalone native
+   binary with `kernel32` as its only link-time import family; `nvcuda.dll` (the OS display
+   driver, present on every NVIDIA Windows box) is loaded dynamically at runtime, and only
+   on GPU commands (`gpu-probe`, `gpu-fuse-test`, `fuse --native`). CPU commands never touch it.
 8. **Never write a sliced model without re-indexing it.**
    Dropping `blocks.18` and leaving `blocks.19..39` in place produces a model that opens
    and then fails. Contiguous renumbering to `blocks.0..blocks.N-1` is part of the slice,
@@ -471,6 +473,12 @@ CUDA-enabled Python with `torch` + `gguf` (the ComfyUI embedded interpreter). So
   `alloc_zeroed(nbytes + 32, "Byte")`, always. Debug heaps tolerate the overrun, which
   hides the bug until release.
 - **`failed to start bazel`** → you invoked the dev shim (`kaindev`). Use plain `kain`.
+- **Kain `Float` is 64-bit (f64, 8-byte stride).** Proven by arena measurement
+  (`alloc_zeroed(100, "Float")` spans 832 bytes). GPUs and file formats speak f32.
+  NEVER hand a `ptr<Float>` to the driver or a byte writer expecting 4-byte lanes.
+  Pack explicitly with `f32_to_bits` / `write_f32_le` / `gpu_pack_f32`, unpack with
+  `f32_from_bits` / `read_f32_le`. (Native `quantize.kn` math is safe: it is f64-
+  consistent end to end, with byte-exact codecs only at container boundaries.)
 - **Byte load/store semantics (exact).**
   - Read byte `i` as `Int`: `mem_load(ptr_offset(buf, i, "Byte"), "Int") & 255`
     (**not** `mem_load "Byte" as Int` — that reinterprets the 8-byte word).
@@ -541,13 +549,18 @@ Reference it; **do not fork it, do not edit it, do not build it.**
 Sibling repos (`../TurboKain/`, `../k_AI_n/`) maintain append-mostly ledgers so work
 survives across agents without silent drift. `juicer.kn` carries the same two files.
 
-### The Agent Workflow: CHECK FIRST, LOG AFTER
+### The Agent Workflow: CHECK FIRST, LOG AFTER, COMMIT + PUSH
 
 1. **CHECK FIRST** — read `memory.tsv` (and the relevant `catalog.tsv` rows) before
    touching code or planning. The ground truth about repo state is in the ledger, not
    in your assumptions.
 2. **LOG AFTER** — every file change (created, edited, moved, deleted) gets a row,
    immediately, via `scripts/memlog.exe`. **No silent edits.**
+3. **COMMIT + PUSH ALWAYS** — when a unit of work is done (feature, fix, battery green,
+   ledger update), commit the full working tree and push to `origin` immediately.
+   Never leave finished work uncommitted for the user to commit by hand. Commit message
+   = short summary + key receipts (e.g. `prove 11/11`, `gpu-fuse-test PASS`). Push to
+   the current branch's upstream on `origin`; never force-push.
 
 ### `memory.tsv` — the change log
 

@@ -1,0 +1,78 @@
+// ============================================================================
+// fusion_kernel.kn — Native GPU LoRA & LyCORIS Fusion Compute Kernel
+//
+// Compiled via `kain gpu-artifacts` to high-performance PTX / SPIR-V.
+// Performs warp-synchronous GEMM and Kronecker fusion directly in GPU VRAM:
+//   - Mode 0: LoRA Low-Rank GEMM:  W_out[r, c] = W_base[r, c] + alpha * (B[r, :] @ A[:, c])
+//   - Mode 1: LyCORIS LoKR:        W_out[r, c] = W_base[r, c] + alpha * (w1[r/m2, c/n2] * w2[r%m2, c%n2])
+// ============================================================================
+
+shader compute FuseLoRA(id: UVec3) -> Void workgroup(16, 16, 1):
+    uniform base_w: StorageBuffer<Float> @0
+    uniform lora_b: StorageBuffer<Float> @1
+    uniform lora_a: StorageBuffer<Float> @2
+    uniform out_w: StorageBuffer<Float> @3
+    uniform params: StorageBuffer<Float> @4
+
+    comptime:
+        let compute = (
+            [256, 256, 1],
+            [
+                ("base_w", "f32", ["dispatch.x"], "input",  "kain.shared.buffer"),
+                ("lora_b", "f32", ["dispatch.x"], "input",  "kain.shared.buffer"),
+                ("lora_a", "f32", ["dispatch.x"], "input",  "kain.shared.buffer"),
+                ("out_w",  "f32", ["dispatch.x"], "output", "kain.shared.buffer"),
+                ("params", "f32", ["16"],         "input",  "kain.shared.buffer")
+            ],
+            []
+        )
+
+    let row = id.x
+    let col = id.y
+
+    // Params layout:
+    // [0] = rows (Float)
+    // [1] = cols (Float)
+    // [2] = rank / m2 (Float)
+    // [3] = n2 (for LoKR)
+    // [4] = alpha / strength (Float)
+    // [5] = mode (0 = LoRA GEMM, 1 = LoKR Kronecker)
+    let n_rows = UInt(params[0])
+    let n_cols = UInt(params[1])
+
+    if row >= n_rows:
+        return
+    if col >= n_cols:
+        return
+
+    let idx = row * n_cols + col
+    let base_val = base_w[idx]
+    let alpha = params[4]
+    let mode = UInt(params[5])
+
+    var delta = Float(0.0)
+
+    if mode == UInt(0):
+        // Standard Low-Rank GEMM: delta = sum_{k=0}^{rank-1} B[row, k] * A[k, col]
+        let rank = UInt(params[2])
+        var k = UInt(0)
+        while k < rank:
+            let b_val = lora_b[row * rank + k]
+            let a_val = lora_a[k * n_cols + col]
+            delta = delta + (b_val * a_val)
+            k = k + UInt(1)
+    elif mode == UInt(1):
+        // LyCORIS LoKR: delta = w1[row/m2, col/n2] * w2[row%m2, col%n2]
+        let m2 = UInt(params[2])
+        let n2 = UInt(params[3])
+        let w1_r = row / m2
+        let w1_c = col / n2
+        let w2_r = row % m2
+        let w2_c = col % n2
+        let w1_cols = n_cols / n2
+        let w1_val = lora_b[w1_r * w1_cols + w1_c]
+        let w2_val = lora_a[w2_r * n2 + w2_c]
+        delta = w1_val * w2_val
+
+    out_w[idx] = base_val + (delta * alpha)
+    return

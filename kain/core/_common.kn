@@ -211,6 +211,44 @@ pub fn read_f32_le(buf: ptr<Byte>, off: Int) -> Float with Unsafe:
     let bits: Int = read_u32_le(buf, off)
     return f32_from_bits(bits)
 
+// Narrow an f64 host value to nearest IEEE-754 binary32 bit pattern (RNE).
+// Needed at every host->device boundary: Kain Float is 64-bit, GPUs speak f32.
+// Subnormals flush to zero; overflow yields Inf; NaN yields canonical NaN.
+pub fn f32_to_bits(val: Float) -> Int with Unsafe:
+    if val == 0.0:
+        return 0
+    let b64: Int = bitcast(val, "I64")
+    let sign: Int = (b64 >> 63) & 1
+    let e64: Int = (b64 >> 52) & 2047
+    let m64: Int = b64 & 4503599627370495
+    if e64 == 0:
+        return 0
+    if e64 == 2047:
+        if m64 == 0:
+            return (sign << 31) + (255 << 23)
+        return (sign << 31) + (255 << 23) + 4194304
+    var e32: Int = e64 - 1023 + 127
+    if e32 >= 255:
+        return (sign << 31) + (255 << 23)
+    if e32 <= 0:
+        return 0
+    let dropped: Int = m64 & 536870911
+    var keep: Int = m64 >> 29
+    if dropped > 268435456:
+        keep = keep + 1
+    elif dropped == 268435456:
+        if (keep & 1) == 1:
+            keep = keep + 1
+    if keep >= 8388608:
+        keep = keep - 8388608
+        e32 = e32 + 1
+        if e32 >= 255:
+            return (sign << 31) + (255 << 23)
+    return (sign << 31) + (e32 << 23) + keep
+
+pub fn write_f32_le(buf: ptr<Byte>, off: Int, val: Float) with Unsafe:
+    write_u32_le(buf, off, f32_to_bits(val))
+
 // ── Text & String Helpers ──────────────────────────────────────────────────
 pub fn str_starts_with(s: String, prefix: String) -> Int:
     let slen: Int = len(s)

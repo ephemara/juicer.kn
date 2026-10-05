@@ -36,7 +36,14 @@ def main():
     print(f" Compiler: {kain}")
     print("================================================================================")
 
-    # 1. Amalgamate
+    # 0. Regenerate GPU kernels (source: kain/gpu/*.kn; output: .kain/gpu/, gitignored)
+    print("\n[Step 0/3] Regenerating GPU artifacts kain/gpu/fusion_kernel.kn -> .kain/gpu/ ...")
+    (ROOT / ".kain" / "gpu").mkdir(parents=True, exist_ok=True)
+    run_cmd([kain, "gpu-artifacts", "kain/gpu/fusion_kernel.kn",
+              "--target", "cuda", "--no-residency",
+              "--output", ".kain/gpu/fusion"])
+
+    # 1. Amalgamation
     print("\n[Step 1/3] Amalgamating kain/core/*.kn -> kain/juicer.kn ...")
     run_cmd([kain, "amalgamate", "--raw", "kain/core", "-o", "kain/juicer.kn"])
 
