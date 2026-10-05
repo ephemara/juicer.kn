@@ -378,6 +378,400 @@ pub fn quantize_superblock_q2_k(in_f32: ptr<Float>, in_offset: Int, out_bytes: p
     decay m4_arr
     return 0
 
+// Dequantize Q4_K super-blocks (144 bytes -> 256 floats, llama.cpp-exact).
+// Layout: d[0..2], dmin[2..4], scales[4..16] (6-bit sc/m via D/M/MD rows),
+// qs[16..144]: q[j][w] = (qs[16+(j/2)*32+w] >> (4*(j%2))) & 15.
+// out = (d*sc[j])*q - (dmin*m[j]).
+pub fn dequantize_q4_k(in_bytes: ptr<Byte>, in_offset: Int, n_super: Int, out_f32: ptr<Float>, out_offset: Int) -> Int with Unsafe:
+    var sbi: Int = 0
+    while sbi < n_super:
+        let base: Int = in_offset + sbi * 144
+        let d_f: Float = fp16_to_fp32(read_u16_le(in_bytes, base))
+        let dmin_f: Float = fp16_to_fp32(read_u16_le(in_bytes, base + 2))
+        var j: Int = 0
+        while j < 8:
+            var sc4: Int = 0
+            var m4: Int = 0
+            if j < 4:
+                sc4 = bref(in_bytes, base + 4 + j) & 63
+                m4 = bref(in_bytes, base + 8 + j) & 63
+            else:
+                let k: Int = j - 4
+                let md: Int = bref(in_bytes, base + 12 + k)
+                let dd: Int = bref(in_bytes, base + 4 + k)
+                let mm: Int = bref(in_bytes, base + 8 + k)
+                sc4 = (md & 15) | ((dd >> 2) & 48)
+                m4 = (md >> 4) | ((mm >> 2) & 48)
+            let step: Float = d_f * (sc4 as Float)
+            let neg_min: Float = dmin_f * (m4 as Float)
+            let shift: Int = (j % 2) * 4
+            let chunk: Int = (j / 2) * 32
+            var w: Int = 0
+            while w < 32:
+                let bv: Int = bref(in_bytes, base + 16 + chunk + w)
+                let q: Int = (bv >> shift) & 15
+                mem_store(ptr_offset(out_f32, out_offset + sbi * 256 + j * 32 + w, "Float"), step * (q as Float) - neg_min, "Float")
+                w = w + 1
+            j = j + 1
+        sbi = sbi + 1
+    return 0
+
+// Quantize 256-element float buffer to GGUF Q4_K super-block (144 bytes) with
+// dual-regime MSE search (regime A: offset-down via m; regime B: span-from-zero).
+// Scales pack: D[k] = (sc[k]&63)|(((sc[k+4]>>4)&3)<<6), M likewise, MD[k] =
+// (sc[k+4]&15)|((m[k+4]&15)<<4). Q nibbles: byte B holds q(2c,B%32) low +
+// q(2c+1,B%32) high — computed pairwise, single store per byte (no RMW).
+pub fn quantize_superblock_q4_k(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<Byte>, out_offset: Int) -> Int with Unsafe:
+    let mn4: ptr<Float> = alloc_zeroed(8 + 32, "Float")
+    let mx4: ptr<Float> = alloc_zeroed(8 + 32, "Float")
+    var j: Int = 0
+    while j < 8:
+        var lo: Float = mem_load(ptr_offset(in_f32, in_offset + j * 32, "Float"), "Float")
+        var hi: Float = lo
+        var w: Int = 1
+        while w < 32:
+            let v: Float = mem_load(ptr_offset(in_f32, in_offset + j * 32 + w, "Float"), "Float")
+            if v < lo:
+                lo = v
+            if v > hi:
+                hi = v
+            w = w + 1
+        mem_store(ptr_offset(mn4, j, "Float"), lo, "Float")
+        mem_store(ptr_offset(mx4, j, "Float"), hi, "Float")
+        j = j + 1
+    var max_range4: Float = 0.0
+    var max_neg4: Float = 0.0
+    var jj: Int = 0
+    while jj < 8:
+        let lo: Float = mem_load(ptr_offset(mn4, jj, "Float"), "Float")
+        let hi: Float = mem_load(ptr_offset(mx4, jj, "Float"), "Float")
+        let r: Float = hi - lo
+        if r > max_range4:
+            max_range4 = r
+        let nm: Float = 0.0 - lo
+        if nm > max_neg4:
+            max_neg4 = nm
+        jj = jj + 1
+    var d_base4: Float = max_range4 / 945.0
+    if d_base4 < 0.000000000001:
+        d_base4 = 0.000000000001
+    var dmin_base4: Float = max_neg4 / 63.0
+    if dmin_base4 < 0.000000000001:
+        dmin_base4 = 0.000000000001
+    let d_u16: Int = fp32_to_fp16(d_base4)
+    let dmin_u16: Int = fp32_to_fp16(dmin_base4)
+    let d_ex: Float = fp16_to_fp32(d_u16)
+    let dmin_ex: Float = fp16_to_fp32(dmin_u16)
+    let sc4k: ptr<Int> = alloc_zeroed(8 + 32, "Int")
+    let m4k: ptr<Int> = alloc_zeroed(8 + 32, "Int")
+    var j2: Int = 0
+    while j2 < 8:
+        let lo: Float = mem_load(ptr_offset(mn4, j2, "Float"), "Float")
+        let hi: Float = mem_load(ptr_offset(mx4, j2, "Float"), "Float")
+        var best_err: Float = 1000000000.0
+        var best_sc: Int = 0
+        var best_m: Int = 0
+        var cand: Int = 0
+        while cand < 6:
+            var alpha: Float = 1.0
+            if cand == 1: alpha = 0.90
+            elif cand == 2: alpha = 0.80
+            elif cand == 3: alpha = 0.70
+            elif cand == 4: alpha = 1.0
+            elif cand == 5: alpha = 0.85
+            var sc_try: Int = 0
+            var m_try: Int = 0
+            if cand < 4:
+                sc_try = ((hi - lo) / (15.0 * d_ex * alpha) + 0.5) as Int
+                if sc_try > 63: sc_try = 63
+                if sc_try < 0: sc_try = 0
+                m_try = ((0.0 - lo) / dmin_ex + 0.5) as Int
+                if m_try > 63: m_try = 63
+                if m_try < 0: m_try = 0
+            else:
+                sc_try = (hi / (15.0 * d_ex * alpha) + 0.5) as Int
+                if sc_try > 63: sc_try = 63
+                if sc_try < 1: sc_try = 1
+                m_try = 0
+            let step_try: Float = d_ex * (sc_try as Float)
+            let min_try: Float = dmin_ex * (m_try as Float)
+            var err_acc: Float = 0.0
+            var w2: Int = 0
+            while w2 < 32:
+                let x: Float = mem_load(ptr_offset(in_f32, in_offset + j2 * 32 + w2, "Float"), "Float")
+                var q: Int = 0
+                if step_try > 0.000000000001:
+                    let t: Float = (x + min_try) / step_try
+                    q = (t + 0.5) as Int
+                    if t < 0.0:
+                        q = (t - 0.5) as Int
+                    if q > 15: q = 15
+                    if q < 0: q = 0
+                let recon: Float = step_try * (q as Float) - min_try
+                let diff: Float = x - recon
+                err_acc = err_acc + diff * diff
+                w2 = w2 + 1
+            if err_acc < best_err:
+                best_err = err_acc
+                best_sc = sc_try
+                best_m = m_try
+            cand = cand + 1
+        mem_store(ptr_offset(sc4k, j2, "Int"), best_sc, "Int")
+        mem_store(ptr_offset(m4k, j2, "Int"), best_m, "Int")
+        if j2 < 2:
+            println("Q46DBG k4 j=" + str(j2) + " best=" + str(best_sc) + "/" + str(best_m) + " rb=" + str(mem_load(ptr_offset(sc4k, j2, "Int"), "Int")))
+        j2 = j2 + 1
+    // Scales rows D/M/MD — fully unrolled straight-line stores. Loop-based
+    // byte stores are unsafe here: the backend down-aligns vectorized stores
+    // and clobbers neighboring bytes (proven by bisection).
+    let s00: Int = mem_load(ptr_offset(sc4k, 0, "Int"), "Int")
+    let s01: Int = mem_load(ptr_offset(sc4k, 1, "Int"), "Int")
+    let s02: Int = mem_load(ptr_offset(sc4k, 2, "Int"), "Int")
+    let s03: Int = mem_load(ptr_offset(sc4k, 3, "Int"), "Int")
+    let s04: Int = mem_load(ptr_offset(sc4k, 4, "Int"), "Int")
+    let s05: Int = mem_load(ptr_offset(sc4k, 5, "Int"), "Int")
+    let s06: Int = mem_load(ptr_offset(sc4k, 6, "Int"), "Int")
+    let s07: Int = mem_load(ptr_offset(sc4k, 7, "Int"), "Int")
+    let m00: Int = mem_load(ptr_offset(m4k, 0, "Int"), "Int")
+    let m01: Int = mem_load(ptr_offset(m4k, 1, "Int"), "Int")
+    let m02: Int = mem_load(ptr_offset(m4k, 2, "Int"), "Int")
+    let m03: Int = mem_load(ptr_offset(m4k, 3, "Int"), "Int")
+    let m04: Int = mem_load(ptr_offset(m4k, 4, "Int"), "Int")
+    let m05: Int = mem_load(ptr_offset(m4k, 5, "Int"), "Int")
+    let m06: Int = mem_load(ptr_offset(m4k, 6, "Int"), "Int")
+    // Q nibbles pairwise FIRST (its vectorized stores down-align and clobber
+    // [0..16]); scales bytes + d/dmin are rewritten after, so every region's
+    // last writer is correct. Byte B = q(2c,w) | (q(2c+1,w) << 4), w = B % 32.
+    var qb: Int = 0
+    while qb < 64:
+        let cc: Int = qb / 32
+        let w: Int = qb % 32
+        let j0: Int = 2 * cc
+        let j1: Int = 2 * cc + 1
+        let s0: Int = mem_load(ptr_offset(sc4k, j0, "Int"), "Int")
+        let s1: Int = mem_load(ptr_offset(sc4k, j1, "Int"), "Int")
+        let n0: Float = dmin_ex * (mem_load(ptr_offset(m4k, j0, "Int"), "Int") as Float)
+        let n1: Float = dmin_ex * (mem_load(ptr_offset(m4k, j1, "Int"), "Int") as Float)
+        let st0: Float = d_ex * (s0 as Float)
+        let st1: Float = d_ex * (s1 as Float)
+        let x0: Float = mem_load(ptr_offset(in_f32, in_offset + j0 * 32 + w, "Float"), "Float")
+        let x1: Float = mem_load(ptr_offset(in_f32, in_offset + j1 * 32 + w, "Float"), "Float")
+        var q0: Int = 0
+        var q1: Int = 0
+        if st0 > 0.000000000001:
+            let t0: Float = (x0 + n0) / st0
+            q0 = (t0 + 0.5) as Int
+            if t0 < 0.0:
+                q0 = (t0 - 0.5) as Int
+            if q0 > 15: q0 = 15
+            if q0 < 0: q0 = 0
+        if st1 > 0.000000000001:
+            let t1: Float = (x1 + n1) / st1
+            q1 = (t1 + 0.5) as Int
+            if t1 < 0.0:
+                q1 = (t1 - 0.5) as Int
+            if q1 > 15: q1 = 15
+            if q1 < 0: q1 = 0
+        if qb < 2:
+            println("Q46DBG qb=" + str(qb) + " s0=" + str(mem_load(ptr_offset(sc4k, j0, "Int"), "Int")) + " x0=" + str(x0 * 100.0) + " q0=" + str(q0) + " q1=" + str(q1))
+        bstore(out_bytes, out_offset + 16 + qb, (q0 & 15) | ((q1 & 15) << 4))
+        qb = qb + 1
+    // Scales rows rewritten AFTER the pack loop (its down-aligned vector
+    // stores clobber [0..16]). Straight-line stores; values from arenas.
+    let s00: Int = mem_load(ptr_offset(sc4k, 0, "Int"), "Int")
+    let s01: Int = mem_load(ptr_offset(sc4k, 1, "Int"), "Int")
+    let s02: Int = mem_load(ptr_offset(sc4k, 2, "Int"), "Int")
+    let s03: Int = mem_load(ptr_offset(sc4k, 3, "Int"), "Int")
+    let s04: Int = mem_load(ptr_offset(sc4k, 4, "Int"), "Int")
+    let s05: Int = mem_load(ptr_offset(sc4k, 5, "Int"), "Int")
+    let s06: Int = mem_load(ptr_offset(sc4k, 6, "Int"), "Int")
+    let s07: Int = mem_load(ptr_offset(sc4k, 7, "Int"), "Int")
+    let m00: Int = mem_load(ptr_offset(m4k, 0, "Int"), "Int")
+    let m01: Int = mem_load(ptr_offset(m4k, 1, "Int"), "Int")
+    let m02: Int = mem_load(ptr_offset(m4k, 2, "Int"), "Int")
+    let m03: Int = mem_load(ptr_offset(m4k, 3, "Int"), "Int")
+    let m04: Int = mem_load(ptr_offset(m4k, 4, "Int"), "Int")
+    let m05: Int = mem_load(ptr_offset(m4k, 5, "Int"), "Int")
+    let m06: Int = mem_load(ptr_offset(m4k, 6, "Int"), "Int")
+    let m07: Int = mem_load(ptr_offset(m4k, 7, "Int"), "Int")
+    println("Q46DBG arena mn4=" + str(ptr_to_int(mn4)) + " mx4=" + str(ptr_to_int(mx4)) + " sc4k=" + str(ptr_to_int(sc4k)) + " m4k=" + str(ptr_to_int(m4k)))
+    bstore(out_bytes, out_offset + 4, (s00 & 63) | (((s04 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 5, (s01 & 63) | (((s05 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 6, (s02 & 63) | (((s06 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 7, (s03 & 63) | (((s07 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 8, (m00 & 63) | (((m04 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 9, (m01 & 63) | (((m05 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 10, (m02 & 63) | (((m06 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 11, (m03 & 63) | (((m07 >> 4) & 3) << 6))
+    bstore(out_bytes, out_offset + 12, (s04 & 15) | ((m04 & 15) << 4))
+    bstore(out_bytes, out_offset + 13, (s05 & 15) | ((m05 & 15) << 4))
+    bstore(out_bytes, out_offset + 14, (s06 & 15) | ((m06 & 15) << 4))
+    bstore(out_bytes, out_offset + 15, (s07 & 15) | ((m07 & 15) << 4))
+    // Trailing super-scales go last (bulk loops overrun).
+    write_u16_le(out_bytes, out_offset, d_u16)
+    write_u16_le(out_bytes, out_offset + 2, dmin_u16)
+    decay mn4
+    decay mx4
+    decay sc4k
+    decay m4k
+    return 0
+
+// Dequantize Q6_K super-blocks (210 bytes -> 256 floats, llama.cpp-exact).
+// Layout: ql[0..128] (4-bit lows, low-first pairs), qh[128..192] (2-bit highs,
+// groups of 4), scales[192..208] (int8 per 16-group), d[208..210] (fp16).
+// flat f: c=f/128, r=f%128; lo=(ql[c*64+(r%64)]>>(4*(r/64)))&15;
+// hi=(qh[c*32+(r%32)]>>(2*(r/32)))&3; out=(d*sc[f/16])*((lo|(hi<<4))-32).
+pub fn dequantize_q6_k(in_bytes: ptr<Byte>, in_offset: Int, n_super: Int, out_f32: ptr<Float>, out_offset: Int) -> Int with Unsafe:
+    var sbi: Int = 0
+    while sbi < n_super:
+        let base: Int = in_offset + sbi * 210
+        let d_f: Float = fp16_to_fp32(read_u16_le(in_bytes, base + 208))
+        var f: Int = 0
+        while f < 256:
+            let c: Int = f / 128
+            let r: Int = f % 128
+            let lo: Int = (bref(in_bytes, base + c * 64 + (r % 64)) >> (4 * (r / 64))) & 15
+            let hi: Int = (bref(in_bytes, base + 128 + c * 32 + (r % 32)) >> (2 * (r / 32))) & 3
+            var sc: Int = bref(in_bytes, base + 192 + f / 16)
+            if sc > 127:
+                sc = sc - 256
+            let q: Int = (lo | (hi << 4)) - 32
+            mem_store(ptr_offset(out_f32, out_offset + sbi * 256 + f, "Float"), (d_f * (sc as Float)) * (q as Float), "Float")
+            f = f + 1
+        sbi = sbi + 1
+    return 0
+
+// Quantize 256-element float buffer to GGUF Q6_K super-block (210 bytes) with
+// per-group MSE step refinement (symmetric, Q4_0-style: no offsets needed).
+// q6 = clamp(q+32) splits low4/high2; ql pairs + qh quads stored once each.
+pub fn quantize_superblock_q6_k(in_f32: ptr<Float>, in_offset: Int, out_bytes: ptr<Byte>, out_offset: Int) -> Int with Unsafe:
+    let amax6: ptr<Float> = alloc_zeroed(16 + 32, "Float")
+    var g: Int = 0
+    while g < 16:
+        var am: Float = 0.0
+        var w: Int = 0
+        while w < 16:
+            let av: Float = math_abs(mem_load(ptr_offset(in_f32, in_offset + g * 16 + w, "Float"), "Float"))
+            if av > am:
+                am = av
+            w = w + 1
+        mem_store(ptr_offset(amax6, g, "Float"), am, "Float")
+        g = g + 1
+    var max_eff: Float = 0.0
+    var gg: Int = 0
+    while gg < 16:
+        let e: Float = mem_load(ptr_offset(amax6, gg, "Float"), "Float") / 31.0
+        if e > max_eff:
+            max_eff = e
+        gg = gg + 1
+    var d_base6: Float = max_eff / 127.0
+    if d_base6 < 0.000000000001:
+        d_base6 = 0.000000000001
+    let d_u16: Int = fp32_to_fp16(d_base6)
+    let d_ex: Float = fp16_to_fp32(d_u16)
+    let sc6: ptr<Int> = alloc_zeroed(16 + 32, "Int")
+    var g2: Int = 0
+    while g2 < 16:
+        let am: Float = mem_load(ptr_offset(amax6, g2, "Float"), "Float")
+        var best_err: Float = 1000000000.0
+        var best_sc: Int = 0
+        var cand: Int = 0
+        while cand < 3:
+            var alpha: Float = 1.0
+            if cand == 1: alpha = 0.90
+            elif cand == 2: alpha = 0.80
+            let eff: Float = am / 31.0
+            var sc_try: Int = (eff / (d_ex * alpha) + 0.5) as Int
+            if sc_try > 127: sc_try = 127
+            if sc_try < 0: sc_try = 0
+            let step_try: Float = d_ex * (sc_try as Float)
+            var err_acc: Float = 0.0
+            var w2: Int = 0
+            while w2 < 16:
+                let x: Float = mem_load(ptr_offset(in_f32, in_offset + g2 * 16 + w2, "Float"), "Float")
+                var q: Int = 0
+                if step_try > 0.000000000001:
+                    let t: Float = x / step_try
+                    q = (t + 0.5) as Int
+                    if t < 0.0:
+                        q = (t - 0.5) as Int
+                    if q > 31: q = 31
+                    if q < -32: q = -32
+                let recon: Float = step_try * (q as Float)
+                let diff: Float = x - recon
+                err_acc = err_acc + diff * diff
+                w2 = w2 + 1
+            if err_acc < best_err:
+                best_err = err_acc
+                best_sc = sc_try
+            cand = cand + 1
+        mem_store(ptr_offset(sc6, g2, "Int"), best_sc, "Int")
+        g2 = g2 + 1
+    // Pack: ql pairs (f=2b,2b+1), qh quads (f=4b..4b+3), scales, d last.
+    var b: Int = 0
+    while b < 128:
+        let f0: Int = 2 * b
+        let f1: Int = 2 * b + 1
+        let g0: Int = f0 / 16
+        let g1: Int = f1 / 16
+        let s0: Int = mem_load(ptr_offset(sc6, g0, "Int"), "Int")
+        let s1: Int = mem_load(ptr_offset(sc6, g1, "Int"), "Int")
+        let st0: Float = d_ex * (s0 as Float)
+        let st1: Float = d_ex * (s1 as Float)
+        let x0: Float = mem_load(ptr_offset(in_f32, in_offset + f0, "Float"), "Float")
+        let x1: Float = mem_load(ptr_offset(in_f32, in_offset + f1, "Float"), "Float")
+        var q0: Int = 0
+        var q1: Int = 0
+        if st0 > 0.000000000001:
+            let t0: Float = x0 / st0
+            q0 = (t0 + 0.5) as Int
+            if t0 < 0.0:
+                q0 = (t0 - 0.5) as Int
+            if q0 > 31: q0 = 31
+            if q0 < -32: q0 = -32
+        if st1 > 0.000000000001:
+            let t1: Float = x1 / st1
+            q1 = (t1 + 0.5) as Int
+            if t1 < 0.0:
+                q1 = (t1 - 0.5) as Int
+            if q1 > 31: q1 = 31
+            if q1 < -32: q1 = -32
+        let v0: Int = q0 + 32
+        let v1: Int = q1 + 32
+        bstore(out_bytes, out_offset + b, (v0 & 15) | ((v1 & 15) << 4))
+        b = b + 1
+    var h: Int = 0
+    while h < 64:
+        var acc: Int = 0
+        var k: Int = 0
+        while k < 4:
+            let f: Int = 4 * h + k
+            let gg2: Int = f / 16
+            let sg: Int = mem_load(ptr_offset(sc6, gg2, "Int"), "Int")
+            let stp: Float = d_ex * (sg as Float)
+            let xv: Float = mem_load(ptr_offset(in_f32, in_offset + f, "Float"), "Float")
+            var qq: Int = 0
+            if stp > 0.000000000001:
+                let tt: Float = xv / stp
+                qq = (tt + 0.5) as Int
+                if tt < 0.0:
+                    qq = (tt - 0.5) as Int
+                if qq > 31: qq = 31
+                if qq < -32: qq = -32
+            let vv: Int = qq + 32
+            acc = acc | (((vv >> 4) & 3) << (2 * k))
+            k = k + 1
+        bstore(out_bytes, out_offset + 128 + h, acc)
+        h = h + 1
+    var sb: Int = 0
+    while sb < 16:
+        bstore(out_bytes, out_offset + 192 + sb, mem_load(ptr_offset(sc6, sb, "Int"), "Int") & 255)
+        sb = sb + 1
+    write_u16_le(out_bytes, out_offset + 208, d_u16)
+    decay amax6
+    decay sc6
+    return 0
+
 // Dequantize Q4_0 blocks to 32-element floats
 pub fn dequantize_q4_0(in_bytes: ptr<Byte>, in_offset: Int, n_blocks: Int, out_f32: ptr<Float>, out_offset: Int) -> Int with Unsafe:
     var b: Int = 0
@@ -1139,4 +1533,998 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
     println(" Elapsed:            " + str(ms_elapsed / 1000) + " s (" + str(mb_s) + " MB/s, 100% native Kain)")
     println(" Output GGUF:       " + out_path)
     return EXIT_OK
+
+// ============================================================================
+// squeeze — Zero-Calibration Spectral Auto-Quantization (native mixed-precision)
+//
+// Sensitivity per tensor i (inheriting parent block b dense stats, V1 granularity):
+//   S_i = RMS_b * sqrt(min(kappa_proxy, 25)) * (1 + max(0, (Kurt_b - 3) / 5))
+// kappa_proxy = max_abs / RMS (power-iteration-free; rho ~= RMS*sqrt(d) on
+// random weights so (max_abs*sqrt(d))/rho ~= max_abs/RMS). Kurt > 8 shields at Q8_0.
+// Greedy demotion by lowest S_i / bytes-saved. Native ladder only: Q8_0 -> Q4_0 -> Q2_K.
+// ============================================================================
+
+pub fn tensor_numel(t_ndims: Int, d0: Int, d1: Int, d2: Int, d3: Int) -> Int with Pure:
+    var n: Int = d0
+    if t_ndims >= 2:
+        n = n * d1
+    if t_ndims >= 3:
+        n = n * d2
+    if t_ndims >= 4:
+        n = n * d3
+    return n
+
+pub fn is_passthrough_name(name: String) -> Int:
+    if find_from(name, "norm", 0) >= 0:
+        return 1
+    if find_from(name, "bias", 0) >= 0:
+        return 1
+    if find_from(name, "scale", 0) >= 0:
+        return 1
+    if find_from(name, "modulation", 0) >= 0:
+        return 1
+    if find_from(name, "embed", 0) >= 0:
+        return 1
+    return 0
+
+pub fn parse_vram_target_bytes(s: String) -> Int:
+    var num_str: String = ""
+    var unit_str: String = ""
+    var i: Int = 0
+    while i < len(s):
+        let c: String = char_at(s, i)
+        var is_numch: Int = 0
+        if c == "0":
+            is_numch = 1
+        elif c == "1":
+            is_numch = 1
+        elif c == "2":
+            is_numch = 1
+        elif c == "3":
+            is_numch = 1
+        elif c == "4":
+            is_numch = 1
+        elif c == "5":
+            is_numch = 1
+        elif c == "6":
+            is_numch = 1
+        elif c == "7":
+            is_numch = 1
+        elif c == "8":
+            is_numch = 1
+        elif c == "9":
+            is_numch = 1
+        elif c == ".":
+            is_numch = 1
+        if is_numch == 1:
+            num_str = num_str + c
+        else:
+            if c != " ":
+                unit_str = unit_str + c
+        i = i + 1
+    let val: Float = parse_float_text(num_str)
+    if str_starts_with(unit_str, "GB") == 1:
+        return (val * 1073741824.0) as Int
+    if str_starts_with(unit_str, "gb") == 1:
+        return (val * 1073741824.0) as Int
+    if str_starts_with(unit_str, "MB") == 1:
+        return (val * 1048576.0) as Int
+    if str_starts_with(unit_str, "mb") == 1:
+        return (val * 1048576.0) as Int
+    if str_starts_with(unit_str, "KB") == 1:
+        return (val * 1024.0) as Int
+    if str_starts_with(unit_str, "kb") == 1:
+        return (val * 1024.0) as Int
+    if str_starts_with(unit_str, "G") == 1:
+        return (val * 1073741824.0) as Int
+    if str_starts_with(unit_str, "g") == 1:
+        return (val * 1073741824.0) as Int
+    if str_starts_with(unit_str, "M") == 1:
+        return (val * 1048576.0) as Int
+    if str_starts_with(unit_str, "m") == 1:
+        return (val * 1048576.0) as Int
+    if str_starts_with(unit_str, "K") == 1:
+        return (val * 1024.0) as Int
+    if str_starts_with(unit_str, "k") == 1:
+        return (val * 1024.0) as Int
+    return parse_int_text(num_str)
+
+pub fn squeeze_sensitivity(rms: Float, max_abs: Float, kurt: Float) -> Float with Pure:
+    var denom: Float = rms
+    if denom < 0.000000001:
+        denom = 0.000000001
+    var k_proxy: Float = max_abs / denom
+    if k_proxy > 25.0:
+        k_proxy = 25.0
+    if k_proxy < 1.0:
+        k_proxy = 1.0
+    var kurt_pen: Float = 0.0
+    if kurt > 3.0:
+        kurt_pen = (kurt - 3.0) / 5.0
+    return rms * math_sqrt(k_proxy) * (1.0 + kurt_pen)
+
+pub fn plan_vram_allocation_gguf(model: GgufModel, target_bytes: Int, block_stats: Array<BlockDenseStats>) -> Array<Int> with Unsafe:
+    var plan: Array<Int> = []
+    let n_tensors: Int = len(model.tensors)
+    var est_total_bytes: Int = model.tensor_data_offset
+    let s_costs: ptr<Float> = alloc_zeroed(n_tensors + 32, "Float")
+    let is_protected: ptr<Int> = alloc_zeroed(n_tensors + 32, "Int")
+    var ti: Int = 0
+    while ti < n_tensors:
+        let t: GgufTensor = model.tensors[ti]
+        let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+        var assigned_type: Int = t.type_id
+        var t_bytes: Int = t.size_bytes
+        var rms: Float = 0.04
+        var mx: Float = 0.04
+        var kurt: Float = 3.0
+        var bi: Int = 0
+        while bi < len(block_stats):
+            if block_stats[bi].block_idx == t.block_idx:
+                rms = block_stats[bi].rms_energy
+                mx = block_stats[bi].max_abs
+                kurt = block_stats[bi].kurtosis
+                break
+            bi = bi + 1
+        let s_i: Float = squeeze_sensitivity(rms, mx, kurt)
+        mem_store(ptr_offset(s_costs, ti, "Float"), s_i, "Float")
+        if kurt > 8.0:
+            mem_store(ptr_offset(is_protected, ti, "Int"), 1, "Int")
+        if t.n_dims >= 2:
+            if (t.dim0 % 32) == 0:
+                if is_passthrough_name(t.name) == 0:
+                    if t.type_id == 0 or t.type_id == 1 or t.type_id == 28:
+                        if (numel % 32) == 0:
+                            assigned_type = 8
+                            t_bytes = (numel / 32) * 34
+        push(plan, assigned_type)
+        est_total_bytes = est_total_bytes + t_bytes
+        ti = ti + 1
+    while est_total_bytes > target_bytes:
+        var best_idx: Int = -1
+        var min_metric: Float = 1000000000.0
+        var i: Int = 0
+        while i < n_tensors:
+            if plan[i] == 8:
+                if mem_load(ptr_offset(is_protected, i, "Int"), "Int") == 0:
+                    let t: GgufTensor = model.tensors[i]
+                    let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+                    let saved: Float = ((numel / 32) * 16) as Float
+                    if saved > 0.5:
+                        let s_i: Float = mem_load(ptr_offset(s_costs, i, "Float"), "Float")
+                        let metric: Float = s_i / saved
+                        if metric < min_metric:
+                            min_metric = metric
+                            best_idx = i
+            i = i + 1
+        if best_idx < 0:
+            break
+        let bnumel: Int = tensor_numel(model.tensors[best_idx].n_dims, model.tensors[best_idx].dim0, model.tensors[best_idx].dim1, model.tensors[best_idx].dim2, model.tensors[best_idx].dim3)
+        plan[best_idx] = 2
+        est_total_bytes = est_total_bytes - (bnumel / 32) * 16
+    while est_total_bytes > target_bytes:
+        var best_idx: Int = -1
+        var min_metric: Float = 1000000000.0
+        var i: Int = 0
+        while i < n_tensors:
+            if plan[i] == 2:
+                if mem_load(ptr_offset(is_protected, i, "Int"), "Int") == 0:
+                    let t: GgufTensor = model.tensors[i]
+                    let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+                    if (t.dim0 % 256) == 0:
+                        if (numel % 256) == 0:
+                            let saved: Float = (((numel / 32) * 18) - ((numel / 256) * 84)) as Float
+                            if saved > 0.5:
+                                let s_i: Float = mem_load(ptr_offset(s_costs, i, "Float"), "Float")
+                                let metric: Float = s_i / saved
+                                if metric < min_metric:
+                                    min_metric = metric
+                                    best_idx = i
+            i = i + 1
+        if best_idx < 0:
+            break
+        let bnumel: Int = tensor_numel(model.tensors[best_idx].n_dims, model.tensors[best_idx].dim0, model.tensors[best_idx].dim1, model.tensors[best_idx].dim2, model.tensors[best_idx].dim3)
+        plan[best_idx] = 10
+        let delta_b: Int = ((bnumel / 32) * 18) - ((bnumel / 256) * 84)
+        est_total_bytes = est_total_bytes - delta_b
+    decay s_costs
+    decay is_protected
+    return plan
+
+pub fn plan_vram_allocation_st(model: SafetensorsModel, target_bytes: Int, block_stats: Array<BlockDenseStats>) -> Array<Int> with Unsafe:
+    var plan: Array<Int> = []
+    let n_tensors: Int = len(model.tensors)
+    var est_total_bytes: Int = 8192
+    let s_costs: ptr<Float> = alloc_zeroed(n_tensors + 32, "Float")
+    let is_protected: ptr<Int> = alloc_zeroed(n_tensors + 32, "Int")
+    var ti: Int = 0
+    while ti < n_tensors:
+        let t: SafetensorsTensor = model.tensors[ti]
+        let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+        var assigned_type: Int = 1
+        var t_bytes: Int = st_passthrough_bytes(t.dtype, numel)
+        if t.dtype == "F32" or t.dtype == "f32":
+            assigned_type = 0
+        var rms: Float = 0.04
+        var mx: Float = 0.04
+        var kurt: Float = 3.0
+        var bi: Int = 0
+        while bi < len(block_stats):
+            if block_stats[bi].block_idx == t.block_idx:
+                rms = block_stats[bi].rms_energy
+                mx = block_stats[bi].max_abs
+                kurt = block_stats[bi].kurtosis
+                break
+            bi = bi + 1
+        let s_i: Float = squeeze_sensitivity(rms, mx, kurt)
+        mem_store(ptr_offset(s_costs, ti, "Float"), s_i, "Float")
+        if kurt > 8.0:
+            mem_store(ptr_offset(is_protected, ti, "Int"), 1, "Int")
+        var lastd: Int = t.dim0
+        if t.n_dims == 2:
+            lastd = t.dim1
+        elif t.n_dims == 3:
+            lastd = t.dim2
+        elif t.n_dims >= 4:
+            lastd = t.dim3
+        if t.n_dims >= 2:
+            if (total_elem_ok(numel, lastd)) == 1:
+                if is_passthrough_name(t.name) == 0:
+                    if is_float_dtype(t.dtype) == 1:
+                        assigned_type = 8
+                        t_bytes = (numel / 32) * 34
+        push(plan, assigned_type)
+        est_total_bytes = est_total_bytes + t_bytes
+        let rem: Int = est_total_bytes % 32
+        if rem != 0:
+            est_total_bytes = est_total_bytes + (32 - rem)
+        ti = ti + 1
+    while est_total_bytes > target_bytes:
+        var best_idx: Int = -1
+        var min_metric: Float = 1000000000.0
+        var i: Int = 0
+        while i < n_tensors:
+            if plan[i] == 8:
+                if mem_load(ptr_offset(is_protected, i, "Int"), "Int") == 0:
+                    let t: SafetensorsTensor = model.tensors[i]
+                    let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+                    let saved: Float = ((numel / 32) * 16) as Float
+                    if saved > 0.5:
+                        let s_i: Float = mem_load(ptr_offset(s_costs, i, "Float"), "Float")
+                        let metric: Float = s_i / saved
+                        if metric < min_metric:
+                            min_metric = metric
+                            best_idx = i
+            i = i + 1
+        if best_idx < 0:
+            break
+        let bnumel: Int = tensor_numel(model.tensors[best_idx].n_dims, model.tensors[best_idx].dim0, model.tensors[best_idx].dim1, model.tensors[best_idx].dim2, model.tensors[best_idx].dim3)
+        plan[best_idx] = 2
+        est_total_bytes = est_total_bytes - (bnumel / 32) * 16
+    while est_total_bytes > target_bytes:
+        var best_idx: Int = -1
+        var min_metric: Float = 1000000000.0
+        var i: Int = 0
+        while i < n_tensors:
+            if plan[i] == 2:
+                if mem_load(ptr_offset(is_protected, i, "Int"), "Int") == 0:
+                    let t: SafetensorsTensor = model.tensors[i]
+                    let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+                    var lastd: Int = t.dim0
+                    if t.n_dims == 2:
+                        lastd = t.dim1
+                    elif t.n_dims == 3:
+                        lastd = t.dim2
+                    elif t.n_dims >= 4:
+                        lastd = t.dim3
+                    if (lastd % 256) == 0:
+                        if (numel % 256) == 0:
+                            let saved: Float = (((numel / 32) * 18) - ((numel / 256) * 84)) as Float
+                            if saved > 0.5:
+                                let s_i: Float = mem_load(ptr_offset(s_costs, i, "Float"), "Float")
+                                let metric: Float = s_i / saved
+                                if metric < min_metric:
+                                    min_metric = metric
+                                    best_idx = i
+            i = i + 1
+        if best_idx < 0:
+            break
+        let bnumel: Int = tensor_numel(model.tensors[best_idx].n_dims, model.tensors[best_idx].dim0, model.tensors[best_idx].dim1, model.tensors[best_idx].dim2, model.tensors[best_idx].dim3)
+        plan[best_idx] = 10
+        let delta_b: Int = ((bnumel / 32) * 18) - ((bnumel / 256) * 84)
+        est_total_bytes = est_total_bytes - delta_b
+    decay s_costs
+    decay is_protected
+    return plan
+
+pub fn total_elem_ok(numel: Int, lastd: Int) -> Int with Pure:
+    if (numel % 32) != 0:
+        return 0
+    if (lastd % 32) != 0:
+        return 0
+    return 1
+
+pub fn is_float_dtype(dtype: String) -> Int:
+    if dtype == "F32" or dtype == "f32":
+        return 1
+    if dtype == "F16" or dtype == "f16":
+        return 1
+    if dtype == "FP16" or dtype == "fp16":
+        return 1
+    if dtype == "BF16" or dtype == "bf16":
+        return 1
+    if dtype == "F8_E4M3" or dtype == "f8_e4m3":
+        return 1
+    if dtype == "float8_e4m3fn":
+        return 1
+    if dtype == "E4M3" or dtype == "e4m3":
+        return 1
+    if dtype == "FP8" or dtype == "fp8":
+        return 1
+    return 0
+
+pub fn st_passthrough_bytes(dtype: String, numel: Int) -> Int with Pure:
+    if dtype == "F32" or dtype == "f32":
+        return numel * 4
+    if dtype == "F8_E4M3" or dtype == "f8_e4m3":
+        return numel
+    if dtype == "float8_e4m3fn":
+        return numel
+    if dtype == "E4M3" or dtype == "e4m3":
+        return numel
+    if dtype == "FP8" or dtype == "fp8":
+        return numel
+    return numel * 2
+
+pub fn mixed_out_bytes(numel: Int, out_type: Int) -> Int with Pure:
+    if out_type == 8:
+        return (numel / 32) * 34
+    if out_type == 2:
+        return (numel / 32) * 18
+    if out_type == 10:
+        return (numel / 256) * 84
+    return 0
+
+pub fn print_squeeze_plan(plan: Array<Int>, target_bytes: Int) -> Int with Unsafe:
+    var n8: Int = 0
+    var n4: Int = 0
+    var n2: Int = 0
+    var npt: Int = 0
+    var i: Int = 0
+    while i < len(plan):
+        if plan[i] == 8:
+            n8 = n8 + 1
+        elif plan[i] == 2:
+            n4 = n4 + 1
+        elif plan[i] == 10:
+            n2 = n2 + 1
+        else:
+            npt = npt + 1
+        i = i + 1
+    println(" Plan: Q8_0=" + str(n8) + " Q4_0=" + str(n4) + " Q2_K=" + str(n2) + " passthrough=" + str(npt))
+    println(" Target VRAM: " + format_bytes(target_bytes))
+    return 0
+
+// GGUF -> GGUF mixed-precision writer: plan[ti] selects Q8_0/Q4_0/Q2_K per tensor.
+// Non-eligible entries keep their original type_id (byte-exact passthrough).
+// Container rule: Q2_K needs dim0%256==0 and numel%256==0, Q8_0/Q4_0 need %32.
+// Anything violating its plan type at write time falls back to passthrough.
+// Planner guarantees validity; the writer re-checks (belt and suspenders).
+pub fn execute_model_quantize_mixed(model: GgufModel, plan: Array<Int>, out_path: String) -> Int with Unsafe:
+    println("\n================================================================================")
+    println(" juicer.kn — Squeeze Mixed-Precision Writer (GGUF -> GGUF, 100% native)")
+    println("================================================================================")
+    println(" Source:      " + model.path + " (" + format_bytes(model.file_size) + ")")
+    println(" Destination: " + out_path)
+    let h_src: ptr<Void> = k_open_read(model.path)
+    if k_handle_bad(h_src) == 1:
+        println("squeeze: failed to open source model " + model.path)
+        return EXIT_ERROR
+    let h_dst: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h_dst) == 1:
+        println("squeeze: failed to open destination file " + out_path)
+        let _c: Int = k_CloseHandle(h_src)
+        return EXIT_ERROR
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let kv_total_len: Int = model.kv_data_offset
+    let kv_buf: ptr<Byte> = alloc_zeroed(kv_total_len + 32, "Byte")
+    let _r_kv: Int = k_read_at(h_src, nslot, 0, kv_buf, kv_total_len)
+    let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_total_len)
+    decay kv_buf
+    let t_buf_sz: Int = 1048576 * 4
+    let t_buf: ptr<Byte> = alloc_zeroed(t_buf_sz + 32, "Byte")
+    var tb_off: Int = 0
+    var cur_payload_offset: Int = 0
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let st: GgufTensor = model.tensors[ti]
+        let tname_bytes: Array<Int> = bytes_of_str(st.name)
+        let tn_len: Int = len(tname_bytes)
+        write_u64_le(t_buf, tb_off, tn_len)
+        tb_off = tb_off + 8
+        var ni: Int = 0
+        while ni < tn_len:
+            bstore(t_buf, tb_off, tname_bytes[ni])
+            tb_off = tb_off + 1
+            ni = ni + 1
+        write_u32_le(t_buf, tb_off, st.n_dims)
+        tb_off = tb_off + 4
+        if st.n_dims >= 1:
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        if st.n_dims >= 2:
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+        if st.n_dims >= 3:
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+        if st.n_dims >= 4:
+            write_u64_le(t_buf, tb_off, st.dim3)
+            tb_off = tb_off + 8
+        let numel: Int = tensor_numel(st.n_dims, st.dim0, st.dim1, st.dim2, st.dim3)
+        var out_type: Int = st.type_id
+        var out_bytes: Int = st.size_bytes
+        if ti < len(plan):
+            let want: Int = plan[ti]
+            if want == 8 or want == 2 or want == 10:
+                var unit: Int = 32
+                if want == 10:
+                    unit = 256
+                if st.n_dims >= 2:
+                    if (numel % unit) == 0:
+                        if (st.dim0 % unit) == 0:
+                            if st.type_id == 0 or st.type_id == 1 or st.type_id == 28:
+                                out_type = want
+                                out_bytes = mixed_out_bytes(numel, want)
+        write_u32_le(t_buf, tb_off, out_type)
+        tb_off = tb_off + 4
+        write_u64_le(t_buf, tb_off, cur_payload_offset)
+        tb_off = tb_off + 8
+        cur_payload_offset = cur_payload_offset + out_bytes
+        let rem: Int = cur_payload_offset % model.alignment
+        if rem != 0:
+            cur_payload_offset = cur_payload_offset + (model.alignment - rem)
+        ti = ti + 1
+    let _w_t: Int = k_write_all(h_dst, nslot, t_buf, tb_off)
+    decay t_buf
+    let total_header_written: Int = kv_total_len + tb_off
+    let pad_needed: Int = (model.alignment - (total_header_written % model.alignment)) % model.alignment
+    if pad_needed > 0:
+        let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+        let _w_pad: Int = k_write_all(h_dst, nslot, pad_buf, pad_needed)
+        decay pad_buf
+    println(" Header & Tensor Directory configured.")
+    println(" Streaming payloads with mixed-precision AVX2 quantization ...")
+    let chunk_size: Int = 8388608
+    let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    var stream_i: Int = 0
+    var passthrough_tensors: Int = 0
+    var q8_tensors: Int = 0
+    var q4_tensors: Int = 0
+    var q2_tensors: Int = 0
+    while stream_i < len(model.tensors):
+        let orig_t: GgufTensor = model.tensors[stream_i]
+        let src_abs_off: Int = model.tensor_data_offset + orig_t.offset
+        let numel: Int = tensor_numel(orig_t.n_dims, orig_t.dim0, orig_t.dim1, orig_t.dim2, orig_t.dim3)
+        var want: Int = orig_t.type_id
+        if stream_i < len(plan):
+            want = plan[stream_i]
+        var is_recompressed: Int = 0
+        var unit: Int = 32
+        if want == 10:
+            unit = 256
+        if want == 8 or want == 2 or want == 10:
+            if orig_t.n_dims >= 2:
+                if (numel % unit) == 0:
+                    if (orig_t.dim0 % unit) == 0:
+                        if orig_t.type_id == 0 or orig_t.type_id == 1 or orig_t.type_id == 28:
+                            is_recompressed = 1
+        if is_recompressed == 0:
+            passthrough_tensors = passthrough_tensors + 1
+            var remaining: Int = orig_t.size_bytes
+            var cur_chunk_src: Int = src_abs_off
+            while remaining > 0:
+                var to_read: Int = remaining
+                if to_read > chunk_size:
+                    to_read = chunk_size
+                let r_act: Int = k_read_at(h_src, nslot, cur_chunk_src, dma_buf, to_read)
+                if r_act <= 0:
+                    break
+                let _w_act: Int = k_write_all(h_dst, nslot, dma_buf, r_act)
+                cur_chunk_src = cur_chunk_src + r_act
+                remaining = remaining - r_act
+        else:
+            if want == 8:
+                q8_tensors = q8_tensors + 1
+            elif want == 2:
+                q4_tensors = q4_tensors + 1
+            else:
+                q2_tensors = q2_tensors + 1
+            let src_kind: Int = orig_t.type_id
+            var src_bpe: Int = 2
+            if src_kind == 0:
+                src_bpe = 4
+            let n_blocks: Int = numel / unit
+            var cur_b: Int = 0
+            while cur_b < n_blocks:
+                var batch: Int = 2048
+                if want == 10:
+                    batch = 256
+                if cur_b + batch > n_blocks:
+                    batch = n_blocks - cur_b
+                let elem_count: Int = batch * unit
+                let f32_arena: ptr<Float> = alloc_zeroed(elem_count + 32, "Float")
+                let batch_src_bytes: Int = elem_count * src_bpe
+                let cur_src_pos: Int = src_abs_off + (cur_b * unit * src_bpe)
+                let r_act: Int = k_read_at(h_src, nslot, cur_src_pos, dma_buf, batch_src_bytes)
+                var di: Int = 0
+                while di < elem_count:
+                    if src_kind == 0:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), read_f32_le(dma_buf, di * 4), "Float")
+                    elif src_kind == 1:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fp16_to_fp32(read_u16_le(dma_buf, di * 2)), "Float")
+                    else:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), bf16_to_fp32(read_u16_le(dma_buf, di * 2)), "Float")
+                    di = di + 1
+                if want == 8:
+                    let qb: ptr<Byte> = alloc_zeroed(batch * 34 + 32, "Byte")
+                    var b_idx: Int = 0
+                    while b_idx < batch:
+                        quantize_block_q8_0(f32_arena, b_idx * 32, qb, b_idx * 34)
+                        b_idx = b_idx + 1
+                    let _w_q: Int = k_write_all(h_dst, nslot, qb, batch * 34)
+                    decay qb
+                elif want == 2:
+                    let qb: ptr<Byte> = alloc_zeroed(batch * 18 + 32, "Byte")
+                    var b_idx: Int = 0
+                    while b_idx < batch:
+                        quantize_block_q4_0(f32_arena, b_idx * 32, qb, b_idx * 18)
+                        b_idx = b_idx + 1
+                    let _w_q: Int = k_write_all(h_dst, nslot, qb, batch * 18)
+                    decay qb
+                else:
+                    let qb: ptr<Byte> = alloc_zeroed(batch * 84 + 32, "Byte")
+                    var b_idx: Int = 0
+                    while b_idx < batch:
+                        quantize_superblock_q2_k(f32_arena, b_idx * 256, qb, b_idx * 84)
+                        b_idx = b_idx + 1
+                    let _w_q: Int = k_write_all(h_dst, nslot, qb, batch * 84)
+                    decay qb
+                decay f32_arena
+                cur_b = cur_b + batch
+        var written_tensor_bytes: Int = orig_t.size_bytes
+        if is_recompressed == 1:
+            written_tensor_bytes = mixed_out_bytes(numel, want)
+        let t_pad: Int = (model.alignment - (written_tensor_bytes % model.alignment)) % model.alignment
+        if t_pad > 0:
+            let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+            let _w_tpad: Int = k_write_all(h_dst, nslot, pad_buf, t_pad)
+            decay pad_buf
+        stream_i = stream_i + 1
+    decay dma_buf
+    decay nslot
+    let _c_s: Int = k_CloseHandle(h_src)
+    let _c_d: Int = k_CloseHandle(h_dst)
+    println(" Squeeze complete -> " + out_path)
+    println(" Q8_0=" + str(q8_tensors) + " Q4_0=" + str(q4_tensors) + " Q2_K=" + str(q2_tensors) + " passthrough=" + str(passthrough_tensors))
+    return EXIT_OK
+
+// SafeTensors -> GGUF mixed-precision writer. Same ladder/rules as GGUF path.
+// file_type is advisory under mixed precision: emit 7 (Q8_0 family) and note it.
+pub fn execute_safetensors_quantize_mixed(model: SafetensorsModel, plan: Array<Int>, out_path: String) -> Int with Unsafe:
+    let ms_start: Int = wall_ms()
+    println("\n================================================================================")
+    println(" juicer.kn — Squeeze Mixed-Precision Writer (SafeTensors -> GGUF, 100% native)")
+    println("================================================================================")
+    println(" Source:      " + model.path + " (" + format_bytes(model.file_size) + ")")
+    println(" Destination: " + out_path)
+    var arch_name: String = "flux"
+    var ai: Int = 0
+    while ai < len(model.tensors):
+        let tn: String = model.tensors[ai].name
+        if find_from(tn, "diffusion_model.", 0) >= 0 or find_from(tn, "v2_i2v", 0) >= 0 or find_from(tn, "wan", 0) >= 0:
+            arch_name = "wan"
+            break
+        elif find_from(tn, "double_blocks.", 0) >= 0 or find_from(tn, "single_blocks.", 0) >= 0:
+            arch_name = "flux"
+            break
+        elif find_from(tn, "model.layers.", 0) >= 0 or find_from(tn, "blk.", 0) >= 0:
+            arch_name = "llama"
+            break
+        ai = ai + 1
+    println(" Architecture: " + arch_name + " (file_type=7 mixed)")
+    let h_src: ptr<Void> = k_open_read(model.path)
+    if k_handle_bad(h_src) == 1:
+        println("squeeze: failed to open source model " + model.path)
+        return EXIT_ERROR
+    let h_dst: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h_dst) == 1:
+        println("squeeze: failed to open destination file " + out_path)
+        let _c: Int = k_CloseHandle(h_src)
+        return EXIT_ERROR
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let kv_max_sz: Int = 65536
+    let kv_buf: ptr<Byte> = alloc_zeroed(kv_max_sz + 32, "Byte")
+    var kv_off: Int = 0
+    write_u32_le(kv_buf, kv_off, GGUF_MAGIC)
+    kv_off = kv_off + 4
+    write_u32_le(kv_buf, kv_off, 3)
+    kv_off = kv_off + 4
+    write_u64_le(kv_buf, kv_off, model.tensor_count)
+    kv_off = kv_off + 8
+    write_u64_le(kv_buf, kv_off, 5)
+    kv_off = kv_off + 8
+    let w1: Int = write_gguf_kv_string(kv_buf, kv_off, "general.architecture", arch_name)
+    kv_off = kv_off + w1
+    let w2: Int = write_gguf_kv_u32(kv_buf, kv_off, "general.quantization_version", 2)
+    kv_off = kv_off + w2
+    let w3: Int = write_gguf_kv_u32(kv_buf, kv_off, "general.alignment", 32)
+    kv_off = kv_off + w3
+    let w4: Int = write_gguf_kv_u32(kv_buf, kv_off, "general.file_type", 7)
+    kv_off = kv_off + w4
+    let blk_key: String = arch_name + ".block_count"
+    let w5: Int = write_gguf_kv_u32(kv_buf, kv_off, blk_key, model.block_count)
+    kv_off = kv_off + w5
+    let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_off)
+    decay kv_buf
+    let t_buf_sz: Int = 1048576 * 4
+    let t_buf: ptr<Byte> = alloc_zeroed(t_buf_sz + 32, "Byte")
+    var tb_off: Int = 0
+    let alignment: Int = 32
+    var cur_payload_offset: Int = 0
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let st: SafetensorsTensor = model.tensors[ti]
+        let tname_bytes: Array<Int> = bytes_of_str(st.name)
+        let tn_len: Int = len(tname_bytes)
+        write_u64_le(t_buf, tb_off, tn_len)
+        tb_off = tb_off + 8
+        var ni: Int = 0
+        while ni < tn_len:
+            bstore(t_buf, tb_off, tname_bytes[ni])
+            tb_off = tb_off + 1
+            ni = ni + 1
+        write_u32_le(t_buf, tb_off, st.n_dims)
+        tb_off = tb_off + 4
+        if st.n_dims == 1:
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        elif st.n_dims == 2:
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        elif st.n_dims == 3:
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        elif st.n_dims >= 4:
+            write_u64_le(t_buf, tb_off, st.dim3)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        let numel: Int = tensor_numel(st.n_dims, st.dim0, st.dim1, st.dim2, st.dim3)
+        var out_type: Int = 1
+        var out_bytes: Int = st_passthrough_bytes(st.dtype, numel)
+        if st.dtype == "F32" or st.dtype == "f32":
+            out_type = 0
+        var lastd: Int = st.dim0
+        if st.n_dims == 2:
+            lastd = st.dim1
+        elif st.n_dims == 3:
+            lastd = st.dim2
+        elif st.n_dims >= 4:
+            lastd = st.dim3
+        if ti < len(plan):
+            let want: Int = plan[ti]
+            if want == 8 or want == 2 or want == 10:
+                var unit: Int = 32
+                if want == 10:
+                    unit = 256
+                if st.n_dims >= 2:
+                    if (numel % unit) == 0:
+                        if (lastd % unit) == 0:
+                            if is_float_dtype(st.dtype) == 1:
+                                out_type = want
+                                out_bytes = mixed_out_bytes(numel, want)
+        write_u32_le(t_buf, tb_off, out_type)
+        tb_off = tb_off + 4
+        write_u64_le(t_buf, tb_off, cur_payload_offset)
+        tb_off = tb_off + 8
+        cur_payload_offset = cur_payload_offset + out_bytes
+        let rem: Int = cur_payload_offset % alignment
+        if rem != 0:
+            cur_payload_offset = cur_payload_offset + (alignment - rem)
+        ti = ti + 1
+    let _w_t: Int = k_write_all(h_dst, nslot, t_buf, tb_off)
+    decay t_buf
+    let total_hdr: Int = kv_off + tb_off
+    let pad_needed: Int = (alignment - (total_hdr % alignment)) % alignment
+    if pad_needed > 0:
+        let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+        let _w_pad: Int = k_write_all(h_dst, nslot, pad_buf, pad_needed)
+        decay pad_buf
+    println(" Header & Tensor Directory configured.")
+    println(" Streaming payloads with mixed-precision MSE quantization ...")
+    let chunk_size: Int = 8388608
+    let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    var stream_i: Int = 0
+    var passthrough_cnt: Int = 0
+    var q8_tensors: Int = 0
+    var q4_tensors: Int = 0
+    var q2_tensors: Int = 0
+    while stream_i < len(model.tensors):
+        let st: SafetensorsTensor = model.tensors[stream_i]
+        let src_abs_off: Int = model.data_offset + st.offset_begin
+        let numel: Int = tensor_numel(st.n_dims, st.dim0, st.dim1, st.dim2, st.dim3)
+        var want: Int = -1
+        if stream_i < len(plan):
+            want = plan[stream_i]
+        var lastd_t: Int = st.dim0
+        if st.n_dims == 2:
+            lastd_t = st.dim1
+        elif st.n_dims == 3:
+            lastd_t = st.dim2
+        elif st.n_dims >= 4:
+            lastd_t = st.dim3
+        var is_recompressed: Int = 0
+        var unit: Int = 32
+        if want == 10:
+            unit = 256
+        if want == 8 or want == 2 or want == 10:
+            if st.n_dims >= 2:
+                if (numel % unit) == 0:
+                    if (lastd_t % unit) == 0:
+                        if is_float_dtype(st.dtype) == 1:
+                            is_recompressed = 1
+        var written_tensor_bytes: Int = 0
+        if is_recompressed == 0:
+            passthrough_cnt = passthrough_cnt + 1
+            var remaining: Int = st.size_bytes
+            var cur_chunk_src: Int = src_abs_off
+            var is_bf16: Int = 0
+            if st.dtype == "BF16" or st.dtype == "bf16":
+                is_bf16 = 1
+            while remaining > 0:
+                var to_read: Int = remaining
+                if to_read > chunk_size:
+                    to_read = chunk_size
+                let r_act: Int = k_read_at(h_src, nslot, cur_chunk_src, dma_buf, to_read)
+                if r_act <= 0:
+                    break
+                if is_bf16 == 1:
+                    let n_h: Int = r_act / 2
+                    let f16_buf: ptr<Byte> = alloc_zeroed(r_act + 32, "Byte")
+                    var hi: Int = 0
+                    while hi < n_h:
+                        let bf_val: Int = read_u16_le(dma_buf, hi * 2)
+                        write_u16_le(f16_buf, hi * 2, fp32_to_fp16(bf16_to_fp32(bf_val)))
+                        hi = hi + 1
+                    let _w: Int = k_write_all(h_dst, nslot, f16_buf, r_act)
+                    decay f16_buf
+                else:
+                    let _w: Int = k_write_all(h_dst, nslot, dma_buf, r_act)
+                cur_chunk_src = cur_chunk_src + r_act
+                remaining = remaining - r_act
+            written_tensor_bytes = st.size_bytes
+        else:
+            if want == 8:
+                q8_tensors = q8_tensors + 1
+            elif want == 2:
+                q4_tensors = q4_tensors + 1
+            else:
+                q2_tensors = q2_tensors + 1
+            var src_bpe: Int = 2
+            var is_f32: Int = 0
+            var is_f16: Int = 0
+            var is_fp8: Int = 0
+            if st.dtype == "F32" or st.dtype == "f32":
+                src_bpe = 4
+                is_f32 = 1
+            elif st.dtype == "F16" or st.dtype == "f16" or st.dtype == "FP16" or st.dtype == "fp16":
+                is_f16 = 1
+            elif st.dtype == "F8_E4M3" or st.dtype == "f8_e4m3" or st.dtype == "float8_e4m3fn" or st.dtype == "E4M3" or st.dtype == "e4m3" or st.dtype == "FP8" or st.dtype == "fp8":
+                src_bpe = 1
+                is_fp8 = 1
+            let n_blocks: Int = numel / unit
+            var cur_b: Int = 0
+            while cur_b < n_blocks:
+                var batch: Int = 2048
+                if want == 10:
+                    batch = 256
+                if cur_b + batch > n_blocks:
+                    batch = n_blocks - cur_b
+                let elem_count: Int = batch * unit
+                let f32_arena: ptr<Float> = alloc_zeroed(elem_count + 32, "Float")
+                let batch_src_bytes: Int = elem_count * src_bpe
+                let cur_src_pos: Int = src_abs_off + (cur_b * unit * src_bpe)
+                let r_act: Int = k_read_at(h_src, nslot, cur_src_pos, dma_buf, batch_src_bytes)
+                if is_fp8 == 1:
+                    var di: Int = 0
+                    while di < elem_count:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fp8_e4m3_to_fp32(bref(dma_buf, di)), "Float")
+                        di = di + 1
+                elif is_f32 == 1:
+                    var di: Int = 0
+                    while di < elem_count:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), read_f32_le(dma_buf, di * 4), "Float")
+                        di = di + 1
+                elif is_f16 == 1:
+                    var di: Int = 0
+                    while di < elem_count:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), fp16_to_fp32(read_u16_le(dma_buf, di * 2)), "Float")
+                        di = di + 1
+                else:
+                    var di: Int = 0
+                    while di < elem_count:
+                        mem_store(ptr_offset(f32_arena, di, "Float"), bf16_to_fp32(read_u16_le(dma_buf, di * 2)), "Float")
+                        di = di + 1
+                var batch_out_bytes: Int = batch * 34
+                if want == 2:
+                    batch_out_bytes = batch * 18
+                if want == 10:
+                    batch_out_bytes = batch * 84
+                let q_batch: ptr<Byte> = alloc_zeroed(batch_out_bytes + 32, "Byte")
+                var qbi: Int = 0
+                while qbi < batch:
+                    if want == 8:
+                        quantize_block_q8_0(f32_arena, qbi * 32, q_batch, qbi * 34)
+                    elif want == 2:
+                        quantize_block_q4_0(f32_arena, qbi * 32, q_batch, qbi * 18)
+                    elif want == 10:
+                        quantize_superblock_q2_k(f32_arena, qbi * 256, q_batch, qbi * 84)
+                    qbi = qbi + 1
+                decay f32_arena
+                let _w_q: Int = k_write_all(h_dst, nslot, q_batch, batch_out_bytes)
+                decay q_batch
+                cur_b = cur_b + batch
+            written_tensor_bytes = mixed_out_bytes(numel, want)
+        let t_pad: Int = (alignment - (written_tensor_bytes % alignment)) % alignment
+        if t_pad > 0:
+            let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+            let _w_tpad: Int = k_write_all(h_dst, nslot, pad_buf, t_pad)
+            decay pad_buf
+        stream_i = stream_i + 1
+    decay dma_buf
+    decay nslot
+    let _c_s: Int = k_CloseHandle(h_src)
+    let _c_d: Int = k_CloseHandle(h_dst)
+    let ms_done: Int = wall_ms()
+    let ms_elapsed: Int = ms_done - ms_start
+    println(" Squeeze complete -> " + out_path)
+    println(" Q8_0=" + str(q8_tensors) + " Q4_0=" + str(q4_tensors) + " Q2_K=" + str(q2_tensors) + " passthrough=" + str(passthrough_cnt))
+    println(" Elapsed: " + str(ms_elapsed / 1000) + " s (100% native Kain)")
+    return EXIT_OK
+
+// GGUF squeeze runner: profile all blocks -> plan -> mixed write.
+pub fn verify_squeeze_plan_gguf(model: GgufModel, plan: Array<Int>) -> Int with Unsafe:
+    var check: Int = model.tensor_data_offset
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: GgufTensor = model.tensors[ti]
+        let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+        var tb: Int = t.size_bytes
+        if ti < len(plan):
+            let want: Int = plan[ti]
+            if want == 8 or want == 2 or want == 10:
+                var unit: Int = 32
+                if want == 10:
+                    unit = 256
+                if t.n_dims >= 2:
+                    if (numel % unit) == 0:
+                        if (t.dim0 % unit) == 0:
+                            if t.type_id == 0 or t.type_id == 1 or t.type_id == 28:
+                                tb = mixed_out_bytes(numel, want)
+        check = check + tb
+        let rem: Int = check % model.alignment
+        if rem != 0:
+            check = check + (model.alignment - rem)
+        ti = ti + 1
+    println(" Verify assigned bytes: " + format_bytes(check))
+    return check
+pub fn run_gguf_squeeze(model_path: String, target_bytes: Int, out_path: String) -> Int with Unsafe:
+    let ms_start: Int = wall_ms()
+    let model: GgufModel = parse_gguf_model(model_path)
+    if model.file_size <= 0:
+        println("squeeze: failed to load model " + model_path)
+        return EXIT_ERROR
+    println("\n================================================================================")
+    println(" juicer.kn — Squeeze Profiler (spectral auto-quant plan)")
+    println("================================================================================")
+    println(" Source: " + model_path + " (" + format_bytes(model.file_size) + ")")
+    let h_w: ptr<Void> = k_open_read(model_path)
+    if k_handle_bad(h_w) == 1:
+        println("squeeze: failed to stream weights " + model_path)
+        return EXIT_ERROR
+    var block_stats: Array<BlockDenseStats> = []
+    var bi: Int = 0
+    while bi < len(model.blocks):
+        let blk: GgufBlock = model.blocks[bi]
+        let ds: BlockDenseStats = compute_gguf_block_dense_stats(h_w, model, blk.block_idx, 256)
+        push(block_stats, ds)
+        bi = bi + 1
+    let _cw: Int = k_CloseHandle(h_w)
+    println(" Profiled " + str(len(block_stats)) + " blocks (256-sample dense census each)")
+    let plan: Array<Int> = plan_vram_allocation_gguf(model, target_bytes, block_stats)
+    let _ps: Int = print_squeeze_plan(plan, target_bytes)
+    let vb: Int = verify_squeeze_plan_gguf(model, plan)
+    if vb > target_bytes:
+        println(" WARNING: target missed by " + format_bytes(vb - target_bytes) + " (kurt>8 floor / Q2_K dim gates hold the rest)")
+    let rc: Int = execute_model_quantize_mixed(model, plan, out_path)
+    let ms_done: Int = wall_ms()
+    println(" Squeeze wall time: " + str((ms_done - ms_start) / 1000) + " s")
+    return rc
+
+// SafeTensors squeeze runner: profile all blocks -> plan -> mixed write.
+pub fn verify_squeeze_plan_st(model: SafetensorsModel, plan: Array<Int>) -> Int with Unsafe:
+    var check: Int = 8192
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: SafetensorsTensor = model.tensors[ti]
+        let numel: Int = tensor_numel(t.n_dims, t.dim0, t.dim1, t.dim2, t.dim3)
+        var tb: Int = st_passthrough_bytes(t.dtype, numel)
+        if ti < len(plan):
+            let want: Int = plan[ti]
+            if want == 8 or want == 2 or want == 10:
+                var unit: Int = 32
+                if want == 10:
+                    unit = 256
+                if t.n_dims >= 2:
+                    if (numel % unit) == 0:
+                        var lastd: Int = t.dim0
+                        if t.n_dims == 2:
+                            lastd = t.dim1
+                        elif t.n_dims == 3:
+                            lastd = t.dim2
+                        elif t.n_dims >= 4:
+                            lastd = t.dim3
+                        if (lastd % unit) == 0:
+                            if is_float_dtype(t.dtype) == 1:
+                                tb = mixed_out_bytes(numel, want)
+        check = check + tb
+        let rem: Int = check % 32
+        if rem != 0:
+            check = check + (32 - rem)
+        ti = ti + 1
+    println(" Verify assigned bytes: " + format_bytes(check))
+    return check
+pub fn run_safetensors_squeeze(model_path: String, target_bytes: Int, out_path: String) -> Int with Unsafe:
+    let ms_start: Int = wall_ms()
+    let model: SafetensorsModel = parse_safetensors_model(model_path)
+    if model.file_size <= 0:
+        println("squeeze: failed to load model " + model_path)
+        return EXIT_ERROR
+    println("\n================================================================================")
+    println(" juicer.kn — Squeeze Profiler (spectral auto-quant plan)")
+    println("================================================================================")
+    println(" Source: " + model_path + " (" + format_bytes(model.file_size) + ")")
+    let h_w: ptr<Void> = k_open_read(model_path)
+    if k_handle_bad(h_w) == 1:
+        println("squeeze: failed to stream weights " + model_path)
+        return EXIT_ERROR
+    var block_stats: Array<BlockDenseStats> = []
+    var bi: Int = 0
+    while bi < len(model.blocks):
+        let blk: SafetensorsBlock = model.blocks[bi]
+        let ds: BlockDenseStats = compute_safetensors_block_dense_stats(h_w, model, blk.block_idx, 256)
+        push(block_stats, ds)
+        bi = bi + 1
+    let _cw: Int = k_CloseHandle(h_w)
+    println(" Profiled " + str(len(block_stats)) + " blocks (256-sample dense census each)")
+    let plan: Array<Int> = plan_vram_allocation_st(model, target_bytes, block_stats)
+    let _ps: Int = print_squeeze_plan(plan, target_bytes)
+    let vb: Int = verify_squeeze_plan_st(model, plan)
+    if vb > target_bytes:
+        println(" WARNING: target missed by " + format_bytes(vb - target_bytes) + " (kurt>8 floor / Q2_K dim gates hold the rest)")
+    let rc: Int = execute_safetensors_quantize_mixed(model, plan, out_path)
+    let ms_done: Int = wall_ms()
+    println(" Squeeze wall time: " + str((ms_done - ms_start) / 1000) + " s")
+    return rc
 

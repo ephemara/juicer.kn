@@ -40,3 +40,8 @@ date	area	type	description	file
 2026-10-05	quantize	verify	SQUEEZED flux-2-klein-9b BF16 16.91GB -> Q2_K 2.78GB (120 tensors) 100% native; gguf-py + ComfyUI-GGUF production dequant clean; RENDERED in ComfyUI with Qwen encoder - works, typical Q2-grade quality	models_t_drive/flux-2-klein-9b-Q2_K.gguf
 2026-10-05	quantize	add	wall_ms() via GetTickCount64 + elapsed/MB/s receipts in execute_safetensors_quantize	kain/core/_common.kn,kain/core/quantize.kn
 2026-10-05	quantize	verify	TIMED RUN: flux-2-klein-4b BF16 7.22GB -> Q2_K 1.18GB in 299s (24 MB/s) 100pct native CPU scalar; gguf-py clean (149 tensors, 88 Q2_K); 9B run now clocked at ~12min by same pace	models_t_drive/flux-2-klein-4b-Q2_K.gguf
+2026-10-05	quantize	verify	4B BENCHMARK: flux-2-klein-4b BF16 7.22GB -> Q4_K_M 2.03GB via GPU Tensor Cores in 14.7s; RENDERED in ComfyUI indistinguishable from base (user-verified visual parity); correct 4B pairing = CLIPLoader + qwen3-4b-heretic.safetensors type flux2 (NOT the 9B uncensored clip)	models_t_drive/flux-2-klein-4b-Q4_K_M.gguf
+2026-10-05	models	add	Klein 4B text-encoder pairing: qwen3-4b-heretic via CLIPLoader type flux2; 9B uses flux2-klein-9b-uncensored-q6_k via CLIPLoaderGGUF	models_t_drive/flux-2-klein-4b-Q4_K_M.gguf
+2026-10-05	core	add	squeeze: zero-cal spectral auto-quant (clamped S_i, greedy 8-2-10 knapsack, mixed GGUF/ST writers, --target-vram)	kain/core/quantize.kn,kain/core/dispatch.kn
+2026-10-05	slicer	add	slice --heal: loader-safe norm folding (alpha clamp 1.0-1.25, key/query_norm.scale match, quant-scale exclusion)	kain/core/slicer.kn,kain/core/dispatch.kn
+2026-10-05	quantize	fix	squeeze FP8: FP8 in float-dtype gate + 1B/elem estimate + fp8_e4m3 decode branch in mixed writer	kain/core/quantize.kn

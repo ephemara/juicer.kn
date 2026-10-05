@@ -378,3 +378,284 @@ pub fn execute_gguf_slice(model: GgufModel, drop_list: Array<Int>, out_path: Str
     println(" Ready to load in ComfyUI, Ollama, LM Studio, or llama.cpp!\n")
 
     return EXIT_OK
+
+// ============================================================================
+// heal — Loader-safe residual healing via downstream norm folding.
+// No new tensors: patch the first surviving block's entrance norm gain by
+//   alpha = min(1.25, max(1.0, sqrt(1 + sum(RMS_dropped^2))))
+// Name matching is substring-based (Wan attn_norm / Flux norm1 / modulation).
+// ============================================================================
+
+pub fn is_heal_target_tensor(name: String, target_block_idx: Int) -> Int:
+    let b_idx: Int = parse_block_index_from_name(name)
+    if b_idx != target_block_idx:
+        return 0
+    if find_from(name, "input_scale", 0) >= 0:
+        return 0
+    if find_from(name, "weight_scale", 0) >= 0:
+        return 0
+    if find_from(name, "attn_norm", 0) >= 0:
+        if find_from(name, "weight", 0) >= 0:
+            return 1
+        return 0
+    if find_from(name, "norm1", 0) >= 0:
+        if find_from(name, "weight", 0) >= 0:
+            return 1
+        return 0
+    if find_from(name, "modulation", 0) >= 0:
+        if find_from(name, "weight", 0) >= 0:
+            return 1
+        return 0
+    if find_from(name, "key_norm", 0) >= 0:
+        if find_from(name, "scale", 0) >= 0:
+            return 1
+        return 0
+    if find_from(name, "query_norm", 0) >= 0:
+        if find_from(name, "scale", 0) >= 0:
+            return 1
+        return 0
+    return 0
+
+pub fn compute_residual_healing_scale(dropped_blocks: Array<Int>, stats_list: Array<BlockDenseStats>) -> Float:
+    var sum_energy: Float = 0.0
+    var di: Int = 0
+    while di < len(dropped_blocks):
+        let b_id: Int = dropped_blocks[di]
+        var si: Int = 0
+        while si < len(stats_list):
+            if stats_list[si].block_idx == b_id:
+                let rms: Float = stats_list[si].rms_energy
+                sum_energy = sum_energy + (rms * rms)
+                break
+            si = si + 1
+        di = di + 1
+    var heal_factor: Float = math_sqrt(1.0 + sum_energy)
+    if heal_factor > 1.25:
+        heal_factor = 1.25
+    if heal_factor < 1.0:
+        heal_factor = 1.0
+    return heal_factor
+
+pub fn execute_gguf_slice_with_heal(model: GgufModel, drop_list: Array<Int>, out_path: String, heal_flag: Int) -> Int with Unsafe:
+    var alpha_heal: Float = 1.0
+    var first_surviving: Int = -1
+    var heal_stats: Array<BlockDenseStats> = []
+    if heal_flag == 1:
+        let h_w: ptr<Void> = k_open_read(model.path)
+        if k_handle_bad(h_w) == 0:
+            var bi: Int = 0
+            while bi < len(model.blocks):
+                let blk: GgufBlock = model.blocks[bi]
+                if is_block_dropped(blk.block_idx, drop_list) == 1:
+                    let ds: BlockDenseStats = compute_gguf_block_dense_stats(h_w, model, blk.block_idx, 256)
+                    push(heal_stats, ds)
+                if is_block_dropped(blk.block_idx, drop_list) == 0:
+                    if blk.block_idx >= 0:
+                        if first_surviving < 0 or blk.block_idx < first_surviving:
+                            var is_downstream: Int = 0
+                            var dj: Int = 0
+                            while dj < len(drop_list):
+                                if blk.block_idx > drop_list[dj]:
+                                    is_downstream = 1
+                                dj = dj + 1
+                            if is_downstream == 1:
+                                if first_surviving < 0 or blk.block_idx < first_surviving:
+                                    first_surviving = blk.block_idx
+                bi = bi + 1
+            let _cw: Int = k_CloseHandle(h_w)
+        alpha_heal = compute_residual_healing_scale(drop_list, heal_stats)
+        println(" Heal: alpha=" + format_2dp(alpha_heal) + " first_surviving=" + str(first_surviving))
+        if first_surviving < 0:
+            println(" Heal: no downstream block found, healing disabled")
+            alpha_heal = 1.0
+    var surviving_tensors: Array<GgufTensor> = []
+    var dropped_tensor_count: Int = 0
+    var dropped_bytes: Int = 0
+    var ti: Int = 0
+    while ti < len(model.tensors):
+        let t: GgufTensor = model.tensors[ti]
+        if t.block_idx >= 0 and is_block_dropped(t.block_idx, drop_list) == 1:
+            dropped_tensor_count = dropped_tensor_count + 1
+            dropped_bytes = dropped_bytes + t.size_bytes
+        else:
+            let new_name: String = reindex_tensor_name(t.name, drop_list)
+            var new_b_idx: Int = -1
+            if t.block_idx >= 0:
+                new_b_idx = compute_new_block_index(t.block_idx, drop_list)
+            let new_t = GgufTensor {
+                name: new_name,
+                n_dims: t.n_dims,
+                dim0: t.dim0,
+                dim1: t.dim1,
+                dim2: t.dim2,
+                dim3: t.dim3,
+                type_id: t.type_id,
+                offset: 0,
+                size_bytes: t.size_bytes,
+                block_idx: new_b_idx,
+            }
+            push(surviving_tensors, new_t)
+        ti = ti + 1
+    println("\n================================================================================")
+    println(" juicer.kn — Physical GGUF Slicing Engine" + " (heal=" + str(heal_flag) + ")")
+    println("================================================================================")
+    println(" Source:       " + model.path + " (" + format_bytes(model.file_size) + ")")
+    println(" Output:       " + out_path)
+    println(" Target drops: " + str(len(drop_list)) + " blocks")
+    println(" Dropped:      " + str(dropped_tensor_count) + " tensors (" + format_bytes(dropped_bytes) + ")")
+    println(" Surviving:    " + str(len(surviving_tensors)) + " tensors")
+    let h_src: ptr<Void> = k_open_read(model.path)
+    if k_handle_bad(h_src) == 1:
+        println("slicer: failed to open source model " + model.path)
+        return EXIT_ERROR
+    let h_dst: ptr<Void> = k_open_write(out_path)
+    if k_handle_bad(h_dst) == 1:
+        println("slicer: failed to open destination file " + out_path)
+        let _c: Int = k_CloseHandle(h_src)
+        return EXIT_ERROR
+    let nslot: ptr<Int> = alloc_zeroed(1, "Int")
+    let kv_total_len: Int = model.kv_data_offset
+    let kv_buf: ptr<Byte> = alloc_zeroed(kv_total_len + 32, "Byte")
+    let r_kv: Int = k_read_at(h_src, nslot, 0, kv_buf, kv_total_len)
+    let st_cnt: Int = len(surviving_tensors)
+    mem_store(ptr_offset(kv_buf, 8, "Byte"), st_cnt, "Int")
+    var new_b_cnt: Int = model.block_count - len(drop_list)
+    if new_b_cnt < 0:
+        new_b_cnt = 0
+    let _p_kv: Int = patch_kv_block_count(kv_buf, kv_total_len, model.kv_count, new_b_cnt)
+    let _w_kv: Int = k_write_all(h_dst, nslot, kv_buf, kv_total_len)
+    decay kv_buf
+    let t_buf_sz: Int = 1048576 * 4
+    let t_buf: ptr<Byte> = alloc_zeroed(t_buf_sz + 32, "Byte")
+    var tb_off: Int = 0
+    var cur_payload_offset: Int = 0
+    var st_i: Int = 0
+    while st_i < len(surviving_tensors):
+        let st: GgufTensor = surviving_tensors[st_i]
+        let tname_bytes: Array<Int> = bytes_of_str(st.name)
+        let tn_len: Int = len(tname_bytes)
+        write_u64_le(t_buf, tb_off, tn_len)
+        tb_off = tb_off + 8
+        var ni: Int = 0
+        while ni < tn_len:
+            bstore(t_buf, tb_off, tname_bytes[ni])
+            tb_off = tb_off + 1
+            ni = ni + 1
+        write_u32_le(t_buf, tb_off, st.n_dims)
+        tb_off = tb_off + 4
+        if st.n_dims >= 1:
+            write_u64_le(t_buf, tb_off, st.dim0)
+            tb_off = tb_off + 8
+        if st.n_dims >= 2:
+            write_u64_le(t_buf, tb_off, st.dim1)
+            tb_off = tb_off + 8
+        if st.n_dims >= 3:
+            write_u64_le(t_buf, tb_off, st.dim2)
+            tb_off = tb_off + 8
+        if st.n_dims >= 4:
+            write_u64_le(t_buf, tb_off, st.dim3)
+            tb_off = tb_off + 8
+        write_u32_le(t_buf, tb_off, st.type_id)
+        tb_off = tb_off + 4
+        write_u64_le(t_buf, tb_off, cur_payload_offset)
+        tb_off = tb_off + 8
+        cur_payload_offset = cur_payload_offset + st.size_bytes
+        let rem: Int = cur_payload_offset % model.alignment
+        if rem != 0:
+            cur_payload_offset = cur_payload_offset + (model.alignment - rem)
+        st_i = st_i + 1
+    let _w_t: Int = k_write_all(h_dst, nslot, t_buf, tb_off)
+    decay t_buf
+    let total_header_written: Int = kv_total_len + tb_off
+    let pad_needed: Int = (model.alignment - (total_header_written % model.alignment)) % model.alignment
+    if pad_needed > 0:
+        let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
+        let _w_pad: Int = k_write_all(h_dst, nslot, pad_buf, pad_needed)
+        decay pad_buf
+    println(" Header & Tensor Directory written (" + format_bytes(total_header_written + pad_needed) + ")")
+    println(" Streaming surviving payloads via direct DMA ...")
+    let chunk_size: Int = 8388608
+    let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    var bytes_streamed: Int = 0
+    var heal_armed: Int = 0
+    if heal_flag == 1:
+        if alpha_heal > 1.000001:
+            if first_surviving >= 0:
+                heal_armed = 1
+    var heal_applied: Int = 0
+    var stream_i: Int = 0
+    while stream_i < len(model.tensors):
+        let orig_t: GgufTensor = model.tensors[stream_i]
+        if orig_t.block_idx < 0 or is_block_dropped(orig_t.block_idx, drop_list) == 0:
+            let src_abs_off: Int = model.tensor_data_offset + orig_t.offset
+            var remaining: Int = orig_t.size_bytes
+            var cur_chunk_src: Int = src_abs_off
+            var is_heal_hit: Int = 0
+            if heal_armed == 1:
+                if is_heal_target_tensor(orig_t.name, first_surviving) == 1:
+                    if orig_t.size_bytes <= chunk_size:
+                        if orig_t.type_id == 0 or orig_t.type_id == 1 or orig_t.type_id == 28:
+                            is_heal_hit = 1
+            while remaining > 0:
+                var to_read: Int = remaining
+                if to_read > chunk_size:
+                    to_read = chunk_size
+                let r_act: Int = k_read_at(h_src, nslot, cur_chunk_src, dma_buf, to_read)
+                if r_act > 0:
+                    if is_heal_hit == 1:
+                        if orig_t.type_id == 0:
+                            let n_f: Int = r_act / 4
+                            var fi: Int = 0
+                            while fi < n_f:
+                                let fval: Float = read_f32_le(dma_buf, fi * 4) * alpha_heal
+                                write_f32_le(dma_buf, fi * 4, fval)
+                                fi = fi + 1
+                        elif orig_t.type_id == 1:
+                            let n_h: Int = r_act / 2
+                            var fi: Int = 0
+                            while fi < n_h:
+                                let u16v: Int = read_u16_le(dma_buf, fi * 2)
+                                let fval: Float = fp16_to_fp32(u16v) * alpha_heal
+                                write_u16_le(dma_buf, fi * 2, fp32_to_fp16(fval))
+                                fi = fi + 1
+                        else:
+                            let n_h: Int = r_act / 2
+                            var fi: Int = 0
+                            while fi < n_h:
+                                let u16v: Int = read_u16_le(dma_buf, fi * 2)
+                                let fval: Float = bf16_to_fp32(u16v) * alpha_heal
+                                let bits32: Int = f32_to_bits(fval)
+                                write_u16_le(dma_buf, fi * 2, (bits32 >> 16) & 65535)
+                                fi = fi + 1
+                        heal_applied = 1
+                        println(" Heal applied: " + orig_t.name)
+                        is_heal_hit = 0
+                    let _w_act: Int = k_write_all(h_dst, nslot, dma_buf, r_act)
+                    cur_chunk_src = cur_chunk_src + r_act
+                    remaining = remaining - r_act
+                    bytes_streamed = bytes_streamed + r_act
+                else:
+                    break
+            let pad_rem: Int = orig_t.size_bytes % model.alignment
+            if pad_rem != 0:
+                let align_pad: Int = model.alignment - pad_rem
+                let zpad: ptr<Byte> = alloc_zeroed(64, "Byte")
+                let _w_zp: Int = k_write_all(h_dst, nslot, zpad, align_pad)
+                decay zpad
+        stream_i = stream_i + 1
+    decay dma_buf
+    decay nslot
+    let _c_src: Int = k_CloseHandle(h_src)
+    let _c_dst: Int = k_CloseHandle(h_dst)
+    let final_sz: Int = total_header_written + pad_needed + bytes_streamed
+    println(" Slicing COMPLETE!")
+    println(" Emitted: " + out_path + " (" + format_bytes(final_sz) + ")")
+    let saved: Int = model.file_size - final_sz
+    println(" Space reclaimed: " + format_bytes(saved) + " (" + format_1dp(((saved as Float) / (model.file_size as Float)) * 100.0) + "% smaller)")
+    if heal_flag == 1:
+        if heal_applied == 1:
+            println(" Heal: downstream norm folded (alpha=" + format_2dp(alpha_heal) + ")")
+        else:
+            println(" Heal: WARNING no matching norm tensor found, emitted unhealed")
+    println(" Ready to load in ComfyUI, Ollama, LM Studio, or llama.cpp!\n")
+    return EXIT_OK
