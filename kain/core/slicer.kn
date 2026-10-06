@@ -576,6 +576,7 @@ pub fn execute_gguf_slice_with_heal(model: GgufModel, drop_list: Array<Int>, out
     println(" Streaming surviving payloads via direct DMA ...")
     let chunk_size: Int = 8388608
     let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    let sl_start: Int = wall_ms()
     var bytes_streamed: Int = 0
     var heal_armed: Int = 0
     if heal_flag == 1:
@@ -642,6 +643,8 @@ pub fn execute_gguf_slice_with_heal(model: GgufModel, drop_list: Array<Int>, out
                 let zpad: ptr<Byte> = alloc_zeroed(64, "Byte")
                 let _w_zp: Int = k_write_all(h_dst, nslot, zpad, align_pad)
                 decay zpad
+        if (stream_i % 100) == 0:
+            print_squeeze_progress(stream_i + 1, len(model.tensors), bytes_streamed, sl_start)
         stream_i = stream_i + 1
     decay dma_buf
     decay nslot

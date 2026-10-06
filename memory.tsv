@@ -45,3 +45,5 @@ date	area	type	description	file
 2026-10-05	core	add	squeeze: zero-cal spectral auto-quant (clamped S_i, greedy 8-2-10 knapsack, mixed GGUF/ST writers, --target-vram)	kain/core/quantize.kn,kain/core/dispatch.kn
 2026-10-05	slicer	add	slice --heal: loader-safe norm folding (alpha clamp 1.0-1.25, key/query_norm.scale match, quant-scale exclusion)	kain/core/slicer.kn,kain/core/dispatch.kn
 2026-10-05	quantize	fix	squeeze FP8: FP8 in float-dtype gate + 1B/elem estimate + fp8_e4m3 decode branch in mixed writer	kain/core/quantize.kn
+2026-10-06	squeeze	update	Wan2.1-14B-FP16 30.5GB -> 16.18GB mixed (480 Q8_0/4 Q2_K/819 float, gguf-py clean); kurt>8 floor shields most 2D -> target missed, needs render verdict	kain/core/quantize.kn
+2026-10-06	core	add	CLI heartbeat: print_squeeze_progress every 50 tensors (MB + MB/s + pct) in mixed writers/slicer + profile loop; arch-detect flux-first + blocks.->wan	kain/core/quantize.kn,kain/core/slicer.kn

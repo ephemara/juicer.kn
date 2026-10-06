@@ -1173,16 +1173,16 @@ pub fn execute_safetensors_quantize(model: SafetensorsModel, target_format: Stri
         unit_elem = 256
         unit_out = 84
 
-    // Detect model architecture
+    // Detect model architecture (flux first: double_blocks contains blocks. too)
     var arch_name: String = "flux"
     var ai: Int = 0
     while ai < len(model.tensors):
         let tn: String = model.tensors[ai].name
-        if find_from(tn, "diffusion_model.", 0) >= 0 or find_from(tn, "v2_i2v", 0) >= 0 or find_from(tn, "wan", 0) >= 0:
-            arch_name = "wan"
-            break
-        elif find_from(tn, "double_blocks.", 0) >= 0 or find_from(tn, "single_blocks.", 0) >= 0:
+        if find_from(tn, "double_blocks.", 0) >= 0 or find_from(tn, "single_blocks.", 0) >= 0:
             arch_name = "flux"
+            break
+        elif find_from(tn, "diffusion_model.", 0) >= 0 or find_from(tn, "v2_i2v", 0) >= 0 or find_from(tn, "wan", 0) >= 0 or find_from(tn, "blocks.", 0) >= 0:
+            arch_name = "wan"
             break
         elif find_from(tn, "model.layers.", 0) >= 0 or find_from(tn, "blk.", 0) >= 0:
             arch_name = "llama"
@@ -1885,6 +1885,18 @@ pub fn mixed_out_bytes(numel: Int, out_type: Int) -> Int with Pure:
         return (numel / 256) * 84
     return 0
 
+pub fn print_squeeze_progress(done_tensors: Int, total_tensors: Int, bytes_written: Int, start_ms: Int) -> Int with Unsafe:
+    var el_s: Int = (wall_ms() - start_ms) / 1000
+    if el_s < 1:
+        el_s = 1
+    let mb_done: Int = bytes_written / 1048576
+    let rate: Int = mb_done / el_s
+    var pct: Int = 100
+    if total_tensors > 0:
+        pct = (done_tensors * 100) / total_tensors
+    println("  [" + str(done_tensors) + "/" + str(total_tensors) + " " + str(pct) + "%] " + str(mb_done) + " MB @ " + str(rate) + " MB/s")
+    return 0
+
 pub fn print_squeeze_plan(plan: Array<Int>, target_bytes: Int) -> Int with Unsafe:
     var n8: Int = 0
     var n4: Int = 0
@@ -1997,6 +2009,8 @@ pub fn execute_model_quantize_mixed(model: GgufModel, plan: Array<Int>, out_path
     println(" Streaming payloads with mixed-precision AVX2 quantization ...")
     let chunk_size: Int = 8388608
     let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    let sq_start: Int = wall_ms()
+    var sq_written: Int = 0
     var stream_i: Int = 0
     var passthrough_tensors: Int = 0
     var q8_tensors: Int = 0
@@ -2100,6 +2114,9 @@ pub fn execute_model_quantize_mixed(model: GgufModel, plan: Array<Int>, out_path
             let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
             let _w_tpad: Int = k_write_all(h_dst, nslot, pad_buf, t_pad)
             decay pad_buf
+        sq_written = sq_written + written_tensor_bytes + t_pad
+        if (stream_i % 50) == 0:
+            print_squeeze_progress(stream_i + 1, len(model.tensors), sq_written, sq_start)
         stream_i = stream_i + 1
     decay dma_buf
     decay nslot
@@ -2122,11 +2139,11 @@ pub fn execute_safetensors_quantize_mixed(model: SafetensorsModel, plan: Array<I
     var ai: Int = 0
     while ai < len(model.tensors):
         let tn: String = model.tensors[ai].name
-        if find_from(tn, "diffusion_model.", 0) >= 0 or find_from(tn, "v2_i2v", 0) >= 0 or find_from(tn, "wan", 0) >= 0:
-            arch_name = "wan"
-            break
-        elif find_from(tn, "double_blocks.", 0) >= 0 or find_from(tn, "single_blocks.", 0) >= 0:
+        if find_from(tn, "double_blocks.", 0) >= 0 or find_from(tn, "single_blocks.", 0) >= 0:
             arch_name = "flux"
+            break
+        elif find_from(tn, "diffusion_model.", 0) >= 0 or find_from(tn, "v2_i2v", 0) >= 0 or find_from(tn, "wan", 0) >= 0 or find_from(tn, "blocks.", 0) >= 0:
+            arch_name = "wan"
             break
         elif find_from(tn, "model.layers.", 0) >= 0 or find_from(tn, "blk.", 0) >= 0:
             arch_name = "llama"
@@ -2255,6 +2272,8 @@ pub fn execute_safetensors_quantize_mixed(model: SafetensorsModel, plan: Array<I
     println(" Streaming payloads with mixed-precision MSE quantization ...")
     let chunk_size: Int = 8388608
     let dma_buf: ptr<Byte> = alloc_zeroed(chunk_size + 32, "Byte")
+    let sq_start: Int = wall_ms()
+    var sq_written: Int = 0
     var stream_i: Int = 0
     var passthrough_cnt: Int = 0
     var q8_tensors: Int = 0
@@ -2391,6 +2410,9 @@ pub fn execute_safetensors_quantize_mixed(model: SafetensorsModel, plan: Array<I
             let pad_buf: ptr<Byte> = alloc_zeroed(64, "Byte")
             let _w_tpad: Int = k_write_all(h_dst, nslot, pad_buf, t_pad)
             decay pad_buf
+        sq_written = sq_written + written_tensor_bytes + t_pad
+        if (stream_i % 50) == 0:
+            print_squeeze_progress(stream_i + 1, len(model.tensors), sq_written, sq_start)
         stream_i = stream_i + 1
     decay dma_buf
     decay nslot
@@ -2449,6 +2471,8 @@ pub fn run_gguf_squeeze(model_path: String, target_bytes: Int, out_path: String)
         let blk: GgufBlock = model.blocks[bi]
         let ds: BlockDenseStats = compute_gguf_block_dense_stats(h_w, model, blk.block_idx, 256)
         push(block_stats, ds)
+        if (bi % 10) == 0:
+            println("  profiled " + str(bi) + "/" + str(len(model.blocks)) + " blocks...")
         bi = bi + 1
     let _cw: Int = k_CloseHandle(h_w)
     println(" Profiled " + str(len(block_stats)) + " blocks (256-sample dense census each)")
@@ -2515,6 +2539,8 @@ pub fn run_safetensors_squeeze(model_path: String, target_bytes: Int, out_path: 
         let blk: SafetensorsBlock = model.blocks[bi]
         let ds: BlockDenseStats = compute_safetensors_block_dense_stats(h_w, model, blk.block_idx, 256)
         push(block_stats, ds)
+        if (bi % 10) == 0:
+            println("  profiled " + str(bi) + "/" + str(len(model.blocks)) + " blocks...")
         bi = bi + 1
     let _cw: Int = k_CloseHandle(h_w)
     println(" Profiled " + str(len(block_stats)) + " blocks (256-sample dense census each)")
