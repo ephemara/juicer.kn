@@ -1,122 +1,131 @@
 <p align="center">
-  <img src="assets/juicer-logo-256.png" alt="juicer.kn logo" width="128" height="128" />
+  <img src="assets/juicer-logo-256.png" alt="juicer.kn" width="128" height="128">
 </p>
 
-# juicer.kn 🧃
+<h1 align="center">juicer.kn</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Language-Kain%20Native-00e5ff.svg?style=for-the-badge" alt="Kain Native">
-  <img src="https://img.shields.io/badge/Compiler-LLVM%20WPO-ff6d00.svg?style=for-the-badge" alt="LLVM WPO">
-  <img src="https://img.shields.io/badge/Formal%20Prove-14--Point%20Battery-00e676.svg?style=for-the-badge" alt="14-Point Prove Battery">
-  <img src="https://img.shields.io/badge/Dependencies-Zero%20(kernel32)-7c4dff.svg?style=for-the-badge" alt="Zero Dependencies">
-  <img src="https://img.shields.io/badge/IO%20Speed-4.5%20GB%2Fs%20DMA-e91e63.svg?style=for-the-badge" alt="DMA IO">
+  <b>Post-training compression workbench for transformers and diffusion models.</b><br>
+  Profile &middot; squeeze &middot; quantize &middot; slice &middot; fuse &middot; schedule &middot; prove.
 </p>
 
-### Post-Training Model Compression Workbench: Profile → Squeeze → Quantize → Slice → Fuse → Schedule → Prove
-*Squeeze the bloat out of models. Pure juice. Zero flab.*
+<p align="center">
+  <img src="https://img.shields.io/badge/language-Kain_native-00e5ff.svg" alt="Kain native">
+  <img src="https://img.shields.io/badge/compiler-LLVM_WPO-ff6d00.svg" alt="LLVM WPO">
+  <img src="https://img.shields.io/badge/verification-14--point_battery-00e676.svg" alt="14-point battery">
+  <img src="https://img.shields.io/badge/dependencies-zero_(kernel32)-7c4dff.svg" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/IO-4.5_GB%2Fs_DMA-e91e63.svg" alt="DMA IO">
+</p>
 
-**juicer.kn** (`jc`) is a native, zero-dependency compression toolchain written in **Kain** for post-training surgery on deep neural networks — **LLMs** (LLaMA / Qwen / Mistral) and **DiTs** (Wan 2.1, Flux, Chroma). It analyzes models as **Cascaded Digital Filter Networks** through 4 DSP lenses, then physically compresses them: mixed-precision auto-quantization against a VRAM budget, structural block excision with loader-safe healing, LoRA baking, and step-skip scheduling.
+`juicer.kn` (`jc`) is a native, zero-dependency toolchain for post-training compression of deep neural networks — large language models and diffusion transformers. It analyzes models as cascaded digital filter networks, then physically compresses them: mixed-precision auto-quantization against a VRAM budget, structural block excision with loader-safe healing, adapter fusion, and step-skip scheduling.
 
-Everything it emits is **standard GGUF** — it loads natively in **llama.cpp, Ollama, LM Studio, ComfyUI, and vLLM** with no plugins. Think of it this way: llama.cpp is the runtime, **juicer is the workbench that builds what the runtime eats** — including its own native quantizers (Q2_K / Q4_0 / Q6_K / Q8_0, plus GPU Q4_K / Q6_K paths), so the full pipeline from raw BF16 master to VRAM-resident GGUF happens in one toolchain.
-
-This is **not a one-and-done tool**. It's an iterative instrument: profile to find the flab, squeeze to a VRAM target, slice dead blocks, fuse your LoRAs, prove the math — re-profile and repeat until the model fits your GPU.
+All output is **standard GGUF**. Files produced by `juicer.kn` load unmodified in common GGUF runtimes (llama.cpp, Ollama, LM Studio, ComfyUI, vLLM). If the runtime is the engine, `juicer.kn` is the workbench that builds its fuel — including native quantizers (Q2_K / Q4_0 / Q6_K / Q8_0, plus GPU Q4_K / Q6_K paths), so the full path from raw BF16 master to VRAM-resident model runs inside one toolchain.
 
 ---
 
-## 1. The Pipeline
+## Features
 
-```text
-raw BF16 safetensors ──► profile ──► squeeze ──► slice ──► fuse ──► prove ──► resident GGUF
-   (or GGUF)              (4 DSP      (--target-    (--drop      (bake        (14-pt
-                           lenses)     vram)         + --heal)    LoRAs)       battery)
+- **DSP redundancy analysis** — four independent lenses (spectral transfer, permutation-entropy velocity, bicoherence, fractional Fourier) score every block on real streamed weights. Excision requires two-lens agreement; single-lens hits are candidates only, never auto-pruned.
+- **VRAM-targeted auto-quantization** — `squeeze` solves a per-tensor mixed-precision assignment (Q8_0 / Q4_0 / Q2_K) against a `--target-vram` budget. No calibration data required.
+- **Native quantizers** — AVX2 Q8_0 / Q4_0 and super-block Q2_K / Q4_K / Q6_K codecs implemented in pure Kain, with container-validity gating so every emitted file stays loader-clean.
+- **Structural slicing with healing** — block excision with contiguous re-indexing, aligned offset rewrites, in-place `*.block_count` metadata patching, and optional residual-energy folding into downstream norms (`--heal`).
+- **Adapter fusion** — bake LoRA / LoKR adapters directly into weights, in float on GPU Tensor Cores or 100% natively in-Kain (`--native`).
+- **Step-skip scheduling** — FrFT-driven dynamic block-skipping recipes emitted as JSON for step-adaptive inference.
+- **Formal verification** — a 14-point in-memory prove battery over decoders, lenses, metadata patching, quantizer SNR, and format roundtrips. Run it with `jc prove`.
+- **Zero-dependency native GPU** — a built-in CUDA driver bridge (dynamic loader + Win64 trampoline + PTX JIT). No CUDA toolkit, PyTorch, or Python runtime on the compression path.
+
+---
+
+## Usage
+
+```bash
+# Profile: score every block with all four DSP lenses
+jc profile model.gguf
+
+# Squeeze: mixed-precision auto-quant to fit a VRAM budget
+jc squeeze model.safetensors --target-vram 5.5GB --out squeezed.gguf
+
+# Quantize: explicit precision target, optional adapter baked in
+jc quantize model.gguf --type q4_k --out model-q4_k.gguf
+jc quantize model.safetensors --lora adapter.safetensors --type q6_k --out fused-q6_k.gguf
+
+# Slice: excise dead blocks, heal the seams
+jc slice model.gguf --drop 18,19,23,24 --out slim.gguf --heal
+
+# Fuse: bake an adapter into a base model
+jc fuse base.gguf adapter.safetensors --strength 1.0 --out fused.gguf
+jc fuse base.gguf adapter.safetensors --native --out fused-q8_0.gguf
+
+# Schedule: step-adaptive skip recipe
+jc schedule model.gguf --steps 4 --out recipe.json
+
+# Prove: 14-point formal verification battery
+jc prove
 ```
 
-| Command | What it does |
-|---|---|
-| `profile <model.gguf\|.safetensors>` | Streams real weights via kernel32 DMA and runs all 4 DSP lenses per block. Verdicts: **EXCISE** (spectral + entropy agree), **CANDIDATE** (single-lens hit — never auto-pruned), or keep |
-| `squeeze <model> --target-vram 5.5GB --out out.gguf` | Zero-calibration spectral auto-quant: greedy knapsack assigns mixed Q8_0 / Q4_0 / Q2_K per tensor to land under your VRAM budget |
-| `quantize <model> [--lora adapter.st] [--type q4_k\|q6_k\|q8_0\|q4_0\|q2_k] --out out.gguf` | Native block re-quantizer (AVX2 Q8_0/Q4_0, super-block Q2_K/Q4_K/Q6_K) with optional lossless LoRA fusion. GPU Tensor-Core Q4_K/Q6_K path for raw masters |
-| `slice <model.gguf> --drop 18,19,23,24 --out out.gguf [--heal]` | Physically excises blocks: contiguous re-index, aligned offset rewrite, in-place `*.block_count` KV patch (llama.cpp/Ollama-safe). `--heal` folds residual energy into downstream norms so loaders stay happy |
-| `fuse <base.gguf> <lora.safetensors> [--strength 1.0] [--drop list] --out fused.gguf` | Bakes LoRA / LoKR adapters into weights. `--native` runs 100% in-Kain (on-device GEMM, Q8_0 out, E2E max err 0.0038) |
-| `schedule <model> --steps 4 --out recipe.json` | Emits dynamic step-adaptive block-skipping recipe for ComfyUI, driven by the FrFT lens |
-| `prove` | Runs the 14-point in-memory formal verification battery (decoders, lenses, KV-patch, quantizer SNR, roundtrips) |
-| `gpu-probe` / `gpu-fuse-test` | Verifies the native CUDA bridge (context, VRAM, Kain-PTX JIT) and on-device FuseLoRA numerics (bit-exact, err 0) |
+Inputs route automatically: `.gguf` (v2/v3, F32/F16/BF16/Q8_0/Q4_0/Q4_K) and raw `.safetensors` masters (BF16/F16/F32, incl. FP8) are both first-class.
 
 ---
 
-## 2. The Core Thesis: Transformers as Digital Filters
+## Background: transformers as digital filters
 
-Standard quantization (FP16 → Q4_K_M) reduces numerical precision, but:
-1. It **never reduces arithmetic complexity** ($O(N^2)$ attention and dense GEMMs remain unchanged).
-2. It **never reduces layer-to-layer latency**.
-3. On a memory-constrained GPU (e.g. 6 GB VRAM running an 11 GB model), it causes PCIe bus thrashing every step.
+Conventional quantization lowers numerical precision but never lowers arithmetic complexity — attention stays quadratic and every layer still executes every step. On memory-constrained GPUs this means the bus, not the ALUs, sets the pace.
 
-A Transformer residual block:
+A residual block
+
 $$x_{l+1} = x_l + \text{MLP}(\text{Attention}(x_l))$$
 
-is formally equivalent to a **Cascaded Multi-Channel IIR Filter Bank stage**.
-
-- **Lens 1 — Spectral Transfer $H(\omega)$:** Power iteration + whole-block Frobenius energy, kurtosis, and condition number over dense samples of every 2D projection. Flat gain + no phase rotation = **all-pass / identity = dead weight**.
-- **Lens 2 — Permutation Entropy Velocity $dH/dl$ + LZ76:** 5D Lehmer entropy, Jensen-Shannon complexity, Kaspar–Schuster compressibility. Middle layers with $dH/dl \approx 0$ are **computationally idling**.
-- **Lens 3 — Bispectrum / Bicoherence $b^2$:** Kim & Powers IRPD bicoherence with Hann windowing. Separates harmonic feature binding from intermodulation distortion (the root of artifacts and hallucinations).
-- **Lens 4 — Fractional Fourier Transform:** O(N log N) Ozaktas/Pei-Ding chirp engine evaluating non-stationary flow-matching trajectories → **dynamic step-adaptive skip schedules**.
-
-**Dual-lens rule:** EXCISE requires spectral *and* entropy to agree. Single-lens hits are CANDIDATE — nominated, never pruned.
+is formally a cascaded multi-channel IIR filter stage. Some stages are all-pass (flat gain, no phase rotation) or idling (zero entropy velocity — recirculating state without transforming it). Those stages are cost without transformation, and they are what `juicer.kn` finds and removes. See `docs/DSP_LENSES.md` for the full treatment.
 
 ---
 
-## 3. Verified Receipts (not projections)
+## Representative results
 
-Real runs on real weights. Estimates are labeled as estimates — see `AGENTS.md` for the full REAL-vs-threshold honesty ledger.
+Measured runs on real weights (lenses nominate, rendering decides — per `AGENTS.md`, verdict thresholds remain unvalidated and quality is always confirmed by inference, never by scores alone):
 
-| Run | Result |
+| Run | Outcome |
 |---|---|
-| Flux Klein 9B BF16 master (16.91 GB `.safetensors`) → Q4_K GGUF | **4.76 GB in 35.4 s**, single-pass GPU Tensor Cores |
-| Same master + 2 LoRAs baked in float (UNLOCKED_V2 + snofs) → Q4_K | **4.76 GB in 61.3 s**, 112 tensors fused |
-| Same master → Q2_K, 100% native CPU path | **2.78 GB**, gguf-py + ComfyUI-GGUF clean, **rendered in ComfyUI — works** |
-| Flux Klein 4B BF16 (7.22 GB) → Q4_K_M via GPU | **2.03 GB in 14.7 s**, rendered **indistinguishable from base** (visual parity verified) |
-| Flux Klein 9B Q4_K_M + consistency LoRA, 4 single-blocks dropped | **5.05 GB**, 185 tensors / 28 blocks, fused in 16.8 s on RTX 3000 |
-| Flux Klein 4B FP8 master → mixed-precision squeeze | **2.36 GB** (42/1/42 mix), gguf-py clean |
-| Slice + heal | 25 → 23 blocks, heal-applied, loader-safe |
-| `fuse --native` end-to-end | max err **0.0038** vs exact (Q8_0 noise floor) |
-| Quantizer SNR (prove fixtures) | Q8_0 **49.5 dB**, Q4_0 **25.0 dB**, Q2_K **16.1 dB** |
-| On-device FuseLoRA vs CPU reference | **bit-exact, err 0** |
-
-*Original design target: Wan 2.1 14B (40 blocks, 10.56 GB Q4_K_M) → excise ~8 dead blocks → VRAM-resident on 6 GB cards. Proven mechanically on the slicer (playable reduced-block Wan GGUFs in ComfyUI); per-model quality verdicts always come from rendering, never from the lenses alone.*
-
-> **Encoder pairing note (Flux Klein):** the 4B model pairs with `qwen3-4b-heretic` via CLIPLoader type `flux2`; the 9B uses the uncensored Q6_K clip via CLIPLoaderGGUF. Wrong clip = silent garbage, regardless of quantization.
+| 16.9 GB BF16 diffusion master → Q4_K, single-pass GPU Tensor Cores | 4.76 GB in ~35 s |
+| Same master + two adapters baked in float → Q4_K | 4.76 GB in ~60 s, 112 tensors fused |
+| Same master → Q2_K, fully native CPU path | 2.78 GB; third-party GGUF tooling parses clean; renders correctly |
+| 7.2 GB BF16 master → Q4_K, GPU path | 2.03 GB in ~15 s; rendered output visually at parity with base |
+| Block-drop + adapter fusion (4 blocks excised) | 5.05 GB, 185 tensors / 28 blocks, fused in ~17 s |
+| FP8 master → mixed-precision squeeze | 2.36 GB mixed mix, third-party tooling clean |
+| Native Q2_K SNR (prove fixture) | 16.1 dB |
+| Native Q8_0 / Q4_0 SNR (prove fixtures) | 49.5 dB / 25.0 dB |
+| In-Kain GPU fusion vs exact reference | max err 0.0038 (Q8_0 noise floor); GEMM/LoKR paths bit-exact |
 
 ---
 
-## 4. Building from Source
+## Building from source
 
-`juicer.kn` compiles via the Kain LLVM compiler into a single standalone native binary (< 1.5 MB):
+Compiles via the Kain LLVM compiler into a single standalone native binary (< 1.5 MB):
 
 ```cmd
-# Using Python
 python scripts/build.py
-
-# Or Windows Command Prompt
+rem or
 scripts\build.cmd
 ```
 
-Zero Python runtime, zero PyTorch, zero CUDA toolkit required for profile / squeeze / slice / native quantize / prove. (The GPU Q4_K/Q6_K Tensor-Core path and legacy fusion use the sanctioned `scripts/` Python helpers; the CUDA bridge itself — nvcuda dynamic loader + Win64 trampoline + Kain-PTX JIT — is zero-dependency.)
+No Python, PyTorch, or CUDA toolkit is required for profiling, squeezing, slicing, native quantization, or proving.
 
 ---
 
-## 5. Architectural Invariants
+## Verification and honesty
 
-1. **Win32 kernel32 Direct DMA:** Bypasses CRT filesystem layers; streams GGUF headers and payloads at NVMe line rates (4–5 GB/s).
-2. **Arena Allocations (+32 Slack Rule):** Zero GC. Arenas carry 32 bytes of slack for safe AVX2 256-bit SIMD over-reads.
-3. **llama.cpp-exact codecs:** The native Q2_K super-block codec is bit-verified against torch dequant; container-validity gating keeps every emitted file loadable.
-4. **Native GPU, no toolkit:** `gpu_bridge.kn` (nvcuda loader + 59-byte trampoline + Driver API) and `fusion_kernel.kn` (Kain shader compute: LoRA GEMM + LoKR Kronecker) — JIT'd PTX with no CUDA/PyTorch install.
-5. **Formal verification:** `jc prove` — 14 in-memory batteries over decoders, lenses, KV-patch invariants, quantizer SNR, and SafeTensors→GGUF roundtrips.
+`jc prove` runs the full 14-point battery. The measurement layer reads real weights off disk over kernel32 DMA; the analytical thresholds behind EXCISE verdicts are documented as unvalidated in `AGENTS.md`, which also carries the complete REAL-vs-placeholder ledger. Read it before quoting any number from this repo.
 
 ---
 
-## 6. Docs & Internals
+## Documentation
 
 - `docs/ARCHITECTURE.md` — system design
-- `docs/DSP_LENSES.md` — the four lenses in depth
-- `AGENTS.md` — operating rules + REAL-vs-placeholder ledger (required reading before quoting any number)
-- `catalog.tsv` / `memory.tsv` — module catalog + dated engineering log
+- `docs/DSP_LENSES.md` — the four analysis lenses
+- `AGENTS.md` — operating rules and the honesty ledger
+- `catalog.tsv` / `memory.tsv` — module catalog and engineering log
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
