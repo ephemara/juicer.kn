@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/juicer-logo-256.png" alt="juicer.kn logo" width="128" height="128" />
+</p>
+
 # juicer.kn 🧃
 
 <p align="center">
