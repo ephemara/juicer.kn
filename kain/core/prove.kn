@@ -13,7 +13,9 @@
 //   [9/11] Native Q8_0 Block Quantization & SNR Invariant (SNR > 35 dB)
 //   [10/11] Native Q4_0 Block Quantization & SNR Invariant (SNR > 20 dB)
 //   [11/11] SafeTensors Zero-Copy DMA Header Parser & Weight Decoder
-//   [12/12] Native Q2_K Super-Block Quantization, Exact Decode & SNR Invariant
+//   [12/14] Native Q2_K Super-Block Quantization, Exact Decode & SNR Invariant
+//   [13/14] Native Q4_K Super-Block Quantization, Exact Decode & SNR Invariant
+//   [14/14] Native Q6_K Super-Block Quantization, Exact Decode & SNR Invariant
 // ============================================================================
 
 use std::runtime
@@ -21,7 +23,7 @@ use std::text
 
 pub fn run_prove_battery() -> Int with Unsafe:
     println("================================================================================")
-    println(" juicer.kn — Unified Formal In-Memory Prove Battery (12 Instruments)")
+    println(" juicer.kn — Unified Formal In-Memory Prove Battery (14 Instruments)")
     println("================================================================================")
 
     var failed: Int = 0
@@ -258,8 +260,8 @@ pub fn run_prove_battery() -> Int with Unsafe:
         println("FAIL (tensor_count=" + str(st_model.tensor_count) + ", sz=" + str(st_model.tensors[0].size_bytes) + ", dt=" + st_model.tensors[0].dtype + ", n_floats=" + str(len(s_floats)) + ")")
         failed = failed + 1
 
-    // [12/12] Native Q2_K Super-Block Quantization: exact hand-fixture + SNR invariant
-    print("[12/12] Native Q2_K Quantization & Exact Decode ... ")
+    // [12/14] Native Q2_K Super-Block Quantization: exact hand-fixture + SNR invariant
+    print("[12/14] Native Q2_K Quantization & Exact Decode ... ")
     // Hand fixture: d=1.0, dmin=0, all sc=1/m=0, all qs=0x55 (q=1) -> 256 exact ones
     let q2_raw: ptr<Byte> = alloc_zeroed(84 + 32, "Byte")
     var q2f: Int = 0
@@ -307,9 +309,142 @@ pub fn run_prove_battery() -> Int with Unsafe:
         println("FAIL (exact_bad=" + str(q2_exact_bad) + ", SNR=" + format_1dp(snr_q2) + " dB)")
         failed = failed + 1
 
+    // [13/14] Native Q4_K Super-Block: exact hand-fixture + SNR invariant
+    print("[13/14] Native Q4_K Quantization & Exact Decode ... ")
+    let q4k_raw: ptr<Byte> = alloc_zeroed(144 + 32, "Byte")
+    write_u16_le(q4k_raw, 0, 15360) // d = fp16(1.0)
+    write_u16_le(q4k_raw, 2, 0)     // dmin = 0
+    bstore(q4k_raw, 4, 2)
+    bstore(q4k_raw, 5, 2)
+    bstore(q4k_raw, 6, 2)
+    bstore(q4k_raw, 7, 2)
+    bstore(q4k_raw, 8, 0)
+    bstore(q4k_raw, 9, 0)
+    bstore(q4k_raw, 10, 0)
+    bstore(q4k_raw, 11, 0)
+    bstore(q4k_raw, 12, 34)
+    bstore(q4k_raw, 13, 34)
+    bstore(q4k_raw, 14, 34)
+    bstore(q4k_raw, 15, 34)
+    var q4q: Int = 0
+    while q4q < 128:
+        bstore(q4k_raw, 16 + q4q, 17)
+        q4q = q4q + 1
+    let q4k_dec: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    dequantize_q4_k(q4k_raw, 0, 1, q4k_dec, 0)
+    var q4fb: Int = 0 - 1
+    var q4fi: Int = 0
+    while q4fi < 256:
+        let dvv: Float = mem_load(ptr_offset(q4k_dec, q4fi, "Float"), "Float")
+        var ddd: Float = dvv - 2.0
+        if ddd < 0.0:
+            ddd = 0.0 - ddd
+        if ddd > 0.000001:
+            if q4fb < 0:
+                q4fb = q4fi
+        q4fi = q4fi + 1
+    println("Q46DBG q4k firstbad=" + str(q4fb))
+    var q4d: Int = 4
+    var dump: String = ""
+    while q4d < 16:
+        dump = dump + str(bref(q4k_raw, q4d)) + ","
+        q4d = q4d + 1
+    println("Q46DBG scales4-15=" + dump)
+    println("Q46DBG q4k[0,1,32,33]=" + str(mem_load(ptr_offset(q4k_dec, 0, "Float"), "Float") * 100.0) + "/" + str(mem_load(ptr_offset(q4k_dec, 1, "Float"), "Float") * 100.0) + "/" + str(mem_load(ptr_offset(q4k_dec, 32, "Float"), "Float") * 100.0) + "/" + str(mem_load(ptr_offset(q4k_dec, 33, "Float"), "Float") * 100.0))
+    var q4k_bad: Int = 0
+    var q4e: Int = 0
+    while q4e < 256:
+        let dv: Float = mem_load(ptr_offset(q4k_dec, q4e, "Float"), "Float")
+        var dd: Float = dv - 2.0
+        if dd < 0.0:
+            dd = 0.0 - dd
+        if dd > 0.000001:
+            q4k_bad = q4k_bad + 1
+        q4e = q4e + 1
+    decay q4k_raw
+    decay q4k_dec
+    let q4k_in: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    let q4k_out: ptr<Byte> = alloc_zeroed(144 + 32, "Byte")
+    let q4k_recon: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    var q4i: Int = 0
+    while q4i < 256:
+        let val: Float = math_sin((q4i as Float) * 0.05) * 5.0
+        mem_store(ptr_offset(q4k_in, q4i, "Float"), val, "Float")
+        q4i = q4i + 1
+    quantize_superblock_q4_k(q4k_in, 0, q4k_out, 0)
+    println("Q46DBG enc d0=" + str(read_u16_le(q4k_out, 0)) + " s4=" + str(bref(q4k_out, 4)) + " q16=" + str(bref(q4k_out, 16)) + " q17=" + str(bref(q4k_out, 17)))
+    println("Q46DBG q4 d0=" + str(read_u16_le(q4k_out, 0)) + " dm0=" + str(read_u16_le(q4k_out, 2)) + " s4=" + str(bref(q4k_out, 4)) + " q16=" + str(bref(q4k_out, 16)))
+    dequantize_q4_k(q4k_out, 0, 1, q4k_recon, 0)
+    var q4r: Int = 0
+    var rq: String = ""
+    while q4r < 8:
+        rq = rq + str(mem_load(ptr_offset(q4k_recon, q4r, "Float"), "Float") * 100.0) + ","
+        q4r = q4r + 1
+    println("Q46DBG q4recon0-7x100=" + rq)
+    let snr_q4k: Float = compute_quantization_snr(q4k_in, q4k_recon, 256)
+    decay q4k_in
+    decay q4k_out
+    decay q4k_recon
+    if q4k_bad == 0 and snr_q4k > 20.0:
+        println("PASS (exact=256/256 twos, SNR=" + format_1dp(snr_q4k) + " dB > 20 dB)")
+    else:
+        println("FAIL (exact_bad=" + str(q4k_bad) + ", SNR=" + format_1dp(snr_q4k) + " dB)")
+        failed = failed + 1
+
+    // [14/14] Native Q6_K Super-Block: exact hand-fixture + SNR invariant
+    print("[14/14] Native Q6_K Quantization & Exact Decode ... ")
+    let q6k_raw: ptr<Byte> = alloc_zeroed(210 + 32, "Byte")
+    var q6s: Int = 0
+    while q6s < 16:
+        bstore(q6k_raw, 192 + q6s, 1)
+        q6s = q6s + 1
+    var q6q: Int = 0
+    while q6q < 128:
+        bstore(q6k_raw, q6q, 17)
+        q6q = q6q + 1
+    // d written last: bulk fill loops overrun into trailing bytes
+    write_u16_le(q6k_raw, 208, 15360) // d = fp16(1.0)
+    // qh stays zeroed (hi=0) -> q = 1-32 = -31
+    let q6k_dec: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    dequantize_q6_k(q6k_raw, 0, 1, q6k_dec, 0)
+    println("Q46DBG q6 raw0=" + str(bref(q6k_raw, 0)) + " sc192=" + str(bref(q6k_raw, 192)) + " d208=" + str(read_u16_le(q6k_raw, 208)) + " re0x1000=" + str(mem_load(ptr_offset(q6k_dec, 0, "Float"), "Float") * 1000.0))
+    let dv0: Float = mem_load(ptr_offset(q6k_dec, 0, "Float"), "Float")
+    println("Q46DBG dv0x1e9=" + str((dv0 + 31.0) * 1000000000.0))
+    var q6k_bad: Int = 0
+    var q6e: Int = 0
+    while q6e < 256:
+        let dv: Float = mem_load(ptr_offset(q6k_dec, q6e, "Float"), "Float")
+        var dd: Float = dv - (0.0 - 31.0)
+        if dd < 0.0:
+            dd = 0.0 - dd
+        if dd > 0.000001:
+            q6k_bad = q6k_bad + 1
+        q6e = q6e + 1
+    decay q6k_raw
+    decay q6k_dec
+    let q6k_in: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    let q6k_out: ptr<Byte> = alloc_zeroed(210 + 32, "Byte")
+    let q6k_recon: ptr<Float> = alloc_zeroed(256 + 32, "Float")
+    var q6i: Int = 0
+    while q6i < 256:
+        let val: Float = math_sin((q6i as Float) * 0.05) * 5.0
+        mem_store(ptr_offset(q6k_in, q6i, "Float"), val, "Float")
+        q6i = q6i + 1
+    quantize_superblock_q6_k(q6k_in, 0, q6k_out, 0)
+    dequantize_q6_k(q6k_out, 0, 1, q6k_recon, 0)
+    let snr_q6k: Float = compute_quantization_snr(q6k_in, q6k_recon, 256)
+    decay q6k_in
+    decay q6k_out
+    decay q6k_recon
+    if q6k_bad == 0 and snr_q6k > 30.0:
+        println("PASS (exact=256/256 -31s, SNR=" + format_1dp(snr_q6k) + " dB > 30 dB)")
+    else:
+        println("FAIL (exact_bad=" + str(q6k_bad) + ", SNR=" + format_1dp(snr_q6k) + " dB)")
+        failed = failed + 1
+
     println("================================================================================")
     if failed == 0:
-        println(" ALL 12 PROVE BATTERIES VERIFIED PASS (100% IN-MEMORY INTEGRITY)!")
+        println(" ALL 14 PROVE BATTERIES VERIFIED PASS (100% IN-MEMORY INTEGRITY)!")
         println("================================================================================")
         return EXIT_OK
     else:
